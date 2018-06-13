@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 
+from argparse import REMAINDER
+
+from pupylib import ROOT
 from pupylib.PupyModule import *
 from pupylib.utils.term import consize
-from argparse import REMAINDER
-from pupylib.utils.rpyc_utils import obtain
-from pupylib.PupyCmd import PupyCmd
+
 from os import path
 from rpyc import GenericException
 
@@ -20,14 +21,15 @@ class PowershellManager(PupyModule):
         'windows': [ 'powershell' ]
     }
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(
-            prog='psh', description=self.__doc__
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(
+            prog='psh', description=cls.__doc__
         )
 
         width, _ = consize()
 
-        commands = self.arg_parser.add_subparsers(title='actions')
+        commands = cls.arg_parser.add_subparsers(title='actions')
         loaded = commands.add_parser('loaded', help='List preapred powershell contexts')
         loaded.add_argument('context', nargs='?', help='Check is context with specified name loaded')
         loaded.set_defaults(name='loaded')
@@ -39,7 +41,7 @@ class PowershellManager(PupyModule):
         load.add_argument('-W', '--width', default=width, type=int, help='Set output line width')
         load.add_argument('-D', '--daemon', action='store_true', default=False, help='Start in "daemon" mode')
         load.add_argument('context', help='Context name')
-        load.add_argument('source', help='Path to PS1 script (local to pupy)')
+        load.add_argument('source', nargs='?', help='Path to PS1 script (local to pupy)')
         load.set_defaults(name='load')
 
         iex = commands.add_parser('iex', help='Invoke expression in context')
@@ -66,30 +68,33 @@ class PowershellManager(PupyModule):
         killall.set_defaults(name='killall')
 
     def run(self, args):
-        powershell = self.client.conn.modules['powershell']
+        loaded = self.client.remote('powershell', 'loaded')
 
         if args.name == 'loaded':
             if args.context:
-                if powershell.loaded(args.context):
+                if loaded(args.context):
                     self.success('{} is loaded'.format(args.context))
                 else:
                     self.error('{} is not loaded'.format(args.context))
             else:
-                contexts = obtain(powershell.loaded())
+                contexts = loaded()
                 for context in contexts:
                     self.success('{}'.format(context))
 
         elif args.name == 'load':
-            script = path.expandvars(path.expanduser(args.source))
-            if not path.exists(script):
-                self.error('Script file not found: {}'.format(script))
-                return
+            load = self.client.remote('powershell', 'load')
+            content = ''
+            if args.source:
+                script = path.expandvars(path.expanduser(args.source))
+                if not path.exists(script):
+                    self.error('Script file not found: {}'.format(script))
+                    return
 
-            with open(script) as input:
-                content = input.read()
+                with open(script) as input:
+                    content = input.read()
 
             try:
-                powershell.load(
+                load(
                     args.context, content, args.force, args.try_64,
                     args.daemon, args.width, args.try_v2
                 )
@@ -98,8 +103,9 @@ class PowershellManager(PupyModule):
 
         elif args.name == 'iex':
             expression = ' '.join(args.expression)
+            call = self.client.remote('powershell', 'call')
 
-            if not powershell.loaded(args.context):
+            if not loaded(args.context):
                 self.error('Context {} is not loaded'.format(args.context))
                 return
 
@@ -108,12 +114,12 @@ class PowershellManager(PupyModule):
                 return
 
             try:
-                result = powershell.call(
+                result = call(
                     args.context, expression, timeout=args.timeout, async=args.background
                 )
 
                 if args.background:
-                    self.warning('Queued: Context: {} RID: {}'.format(args.context, result.rid))
+                    self.warning('Queued: Context: {} RID: {}'.format(args.context, result))
                 else:
                     output, rest = result
 
@@ -132,13 +138,17 @@ class PowershellManager(PupyModule):
                 self.error('iex: {}'.format(e))
 
         elif args.name == 'unload':
+            unload = self.client.remote('powershell', 'unload')
+
             try:
-                powershell.unload(args.context)
+                unload(args.context)
             except Exception, e:
                 self.error('unload: {}'.format(e))
 
         elif args.name == 'result':
-            result = powershell.result(args.context, args.rid)
+            get_result = self.client.remote('powershell', 'result')
+
+            result = get_result(args.context, args.rid)
             if not result:
                 self.error('Result {} does not exists in {}'.format(args.rid, args.context))
             else:
@@ -149,21 +159,21 @@ class PowershellManager(PupyModule):
                     self.log(output)
 
         elif args.name == 'results':
-            if not obtain(powershell.loaded()):
+            get_results = self.client.remote('powershell', 'get_results')
+
+            if not loaded():
                 self.error('No scripts loaded')
                 return
 
-            results = obtain(powershell.results.fget())
+            results = get_results()
             objects = [
                 {
                     'CONTEXT': ctx,
                     'RIDS': ', '.join([str(x) for x in rids])
                 } for ctx, rids in results.iteritems()
             ]
-            self.stdout.write(
-                PupyCmd.table_format(objects, wl=[
-                    'CONTEXT', 'RIDS'
-                ]))
+            self.table(objects, ['CONTEXT', 'RIDS'])
 
         elif args.name == 'killall':
-            powershell.stop()
+            stop = self.client.remote('powershell', 'stop', False)
+            stop()

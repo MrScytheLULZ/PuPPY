@@ -39,7 +39,19 @@ import getpass
 import __future__
 import netaddr
 import psutil
+import pyexpat
+
+try:
+    import kcp
+except:
+    pass
+
+import poster
+
 if 'win' in sys.platform:
     import ctypes.wintypes
+    import win_inet_pton
 else:
     import pty
+
+import umsgpack

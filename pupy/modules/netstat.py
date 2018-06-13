@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
 from pupylib.PupyModule import *
-from pupylib.PupyCmd import PupyCmd
-from pupylib.utils.rpyc_utils import obtain
-from pupylib.utils.term import colorize
-from modules.lib.utils.shell_exec import shell_exec
+from pupylib.PupyOutput import Color
 from collections import OrderedDict
 from datetime import datetime, timedelta
 
@@ -21,20 +18,33 @@ class NetStatModule(PupyModule):
     dependencies = [ 'pupyps' ]
     is_module=False
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog="netstat", description=self.__doc__)
-        self.arg_parser.add_argument('-l', '--listen', action='store_true', help='Show listening sockets')
-        self.arg_parser.add_argument('-t', '--tcp', action='store_true', help='Show TCP')
-        self.arg_parser.add_argument('-u', '--udp', action='store_true', help='Show UDP')
-        self.arg_parser.add_argument('-s', '--show', nargs='+', default=[], help='Filter by word')
-        self.arg_parser.add_argument('-x', '--hide', nargs='+', default=[], help='Filter out by word')
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog="netstat", description=cls.__doc__)
+        cls.arg_parser.add_argument('-l', '--listen', action='store_true', help='Show listening sockets')
+        cls.arg_parser.add_argument('-t', '--tcp', action='store_true', help='Show TCP')
+        cls.arg_parser.add_argument('-u', '--udp', action='store_true', help='Show UDP')
+        cls.arg_parser.add_argument('-s', '--show', nargs='+', default=[], help='Filter by word')
+        cls.arg_parser.add_argument('-x', '--hide', nargs='+', default=[], help='Filter out by word')
 
     def run(self, args):
         try:
-            rpupyps = self.client.conn.modules.pupyps
-            data = obtain(rpupyps.connections())
-            sock = { int(x):y for x,y in obtain(rpupyps.socktypes).iteritems() }
-            families = { int(x):y for x,y in obtain(rpupyps.families).iteritems() }
+            rpupyps = self.client.remote('pupyps')
+            connections = self.client.remote('pupyps', 'connections')
+
+            families = {
+                int(k):v for k,v in self.client.remote_const(
+                    'pupyps', 'families'
+                ).iteritems()
+            }
+
+            socktypes = {
+                int(k):v for k,v in self.client.remote_const(
+                    'pupyps', 'socktypes'
+                ).iteritems()
+            }
+
+            data = connections()
 
             limit = []
 
@@ -53,7 +63,7 @@ class NetStatModule(PupyModule):
 
                 color = ""
                 family = families[connection['family']]
-                stype = sock[connection['type']]
+                stype = socktypes[connection['type']]
 
                 if limit and not stype in limit:
                     continue
@@ -70,31 +80,30 @@ class NetStatModule(PupyModule):
                     deny = True
 
                 connection = {
-                    'AF': colorize(family, color),
-                    'TYPE': colorize(stype, color),
-                    'LADDR': colorize(':'.join([str(x) for x in connection['laddr']]), color),
-                    'RADDR': colorize(':'.join([str(x) for x in connection['raddr']]), color),
-                    'PID': colorize(connection.get('pid', ''), color),
-                    'USER': colorize((connection.get('username') or '').encode('utf8','replace'), color),
-                    'EXE': colorize(
+                    'AF': Color(family, color),
+                    'TYPE': Color(stype, color),
+                    'LADDR': Color(':'.join([str(x) for x in connection['laddr']]), color),
+                    'RADDR': Color(':'.join([str(x) for x in connection['raddr']]), color),
+                    'PID': Color(connection.get('pid', ''), color),
+                    'USER': Color((connection.get('username') or ''), color),
+                    'EXE': Color(
                         connection.get(
-                            'exe', (connection.get('name') or '').encode('utf8','replace')
+                            'exe', (connection.get('name') or '')
                         ), color)
                 }
 
                 for v in connection.itervalues():
-                    if any(h in v for h in args.hide):
+                    if any(str(h) in unicode(v.data) for h in args.hide):
                         deny = True
-                    if any(h in v for h in args.show):
+                    if any(str(h) in unicode(v.data) for h in args.show):
                         deny = False
 
                 if not deny:
                     objects.append(connection)
 
-            self.stdout.write(
-                PupyCmd.table_format(objects, wl=[
-                    'AF', 'TYPE', 'LADDR', 'RADDR', 'USER', 'PID', 'EXE'
-                ]))
+            self.table(objects, [
+                'AF', 'TYPE', 'LADDR', 'RADDR', 'USER', 'PID', 'EXE'
+            ], truncate=True)
 
         except Exception, e:
             logging.exception(e)

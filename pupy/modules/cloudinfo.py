@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 from pupylib.PupyModule import *
-from pupylib.utils.term import colorize
-from pupylib.utils.rpyc_utils import obtain
+from pupylib.PupyOutput import Pygment
 
-from pygments import highlight, lexers, formatters
+from pygments import lexers
 import json
-import os
 
 __class_name__="CloudInfo"
 
@@ -15,24 +13,29 @@ class CloudInfo(PupyModule):
 
     dependencies = [ 'cloudinfo' ]
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog="cloudinfo", description=self.__doc__)
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog="cloudinfo", description=cls.__doc__)
 
     def run(self, args):
-        cloud, metadata = self.client.conn.modules.cloudinfo.metadata()
+        cloudinfo = self.client.remote('cloudinfo', 'metadata')
+
+        cloud, metadata = cloudinfo()
+
         if not cloud:
             self.error('Unknown cloud or non-cloud environment')
             return
 
         self.success('Cloud: {}'.format(cloud))
 
-        metadata = obtain(metadata)
         formatted_json = json.dumps(metadata, indent=1, sort_keys=True)
 
-        self.stdout.write(
-            highlight(
-                unicode(formatted_json, 'UTF-8'),
-                lexers.JsonLexer(),
-                formatters.TerminalFormatter()
-            )
+        self.log(
+            Pygment(lexers.JsonLexer(), unicode(formatted_json, 'UTF-8'))
         )
+
+        if cloud == 'EC2' and 'meta-data' in metadata and 'iam' in metadata['meta-data']:
+            iam = metadata['meta-data']['iam']
+            if 'info' in iam and 'security-credentials' in iam and iam['info']['Code'] == 'Success':
+                arn = iam['info']['InstanceProfileArn'].split('/', 1)[-1]
+                self.success('IAM: {}'.format(arn))

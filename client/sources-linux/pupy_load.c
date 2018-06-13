@@ -53,7 +53,7 @@ static inline void* xz_dynload(const char *soname, const char *xzbuf, size_t xzs
 
     void *res = memdlopen(soname, (char *) uncompressed, uncompressed_size);
 
-    lzmafree(uncompressed);
+    lzmafree(uncompressed, uncompressed_size);
 
     if (!res) {
         dprint("loading %s from memory failed\n", soname);
@@ -103,8 +103,12 @@ uint32_t mainThread(int argc, char *argv[], bool so) {
     if(!Py_IsInitialized()) {
         dprint("Py_IsInitialized\n");
 
+        Py_FileSystemDefaultEncoding = "utf-8";
         Py_IgnoreEnvironmentFlag = 1;
         Py_NoSiteFlag = 1; /* remove site.py auto import */
+        Py_NoUserSiteDirectory = 1;
+        Py_OptimizeFlag = 2;
+        Py_DontWriteBytecodeFlag = 1;
 
 #if defined(Linux)
         dprint("INVOCATION NAME: %s\n", program_invocation_name);
@@ -168,23 +172,16 @@ uint32_t mainThread(int argc, char *argv[], bool so) {
     munmap((char *) bootloader_c_start, bootloader_c_size);
 
     if (seq) {
-        Py_ssize_t i, max = PySequence_Length(seq);
-        for (i=0;i<max;i++) {
-            dprint("LOAD SEQUENCE %d\n", i);
-            PyObject *sub = PySequence_GetItem(seq, i);
-            if (seq) {
-                PyObject *discard = PyEval_EvalCode((PyCodeObject *)sub, d, d);
-                dprint("EVAL CODE %p -> %p\n", sub, discard);
-                if (!discard) {
-                    PyErr_Print();
-                    rc = 255;
-                    break;
-                }
-                Py_XDECREF(discard);
-            }
-            Py_XDECREF(sub);
+        PyObject *discard = PyEval_EvalCode((PyCodeObject *)seq, d, d);
+        dprint("EVAL CODE %p -> %p\n", seq, discard);
+        if (!discard) {
+            PyErr_Print();
+            rc = 255;
         }
+        Py_XDECREF(discard);
     }
+    Py_XDECREF(seq);
+
     dprint("complete ...\n");
     PyGILState_Release(restore_state);
     Py_Finalize();

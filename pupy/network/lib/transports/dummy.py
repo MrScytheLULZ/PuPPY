@@ -1,15 +1,20 @@
-# -*- coding: UTF8 -*-
+# -*- coding: utf-8 -*-
+
+__all__ = [ 'DummyPupyTransport' ]
+
 from ..base import BasePupyTransport
 
 class DummyPupyTransport(BasePupyTransport):
+    __slots__ = ()
+
     def downstream_recv(self, data):
         """
         receiving obfuscated data from the remote client and writing deobfuscated data to downstream
         """
-        self.upstream.write(data.read())
+        data.write_to(self.upstream)
+
     def upstream_recv(self, data):
         """
         receiving clear-text data from local rpyc Stream and writing obfuscated data to upstream
         """
-        self.downstream.write(data.read())
-
+        data.write_to(self.downstream)

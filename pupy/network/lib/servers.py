@@ -2,25 +2,22 @@
 # Copyright (c) 2015, Nicolas VERDIER (contact@n1nj4.eu)
 # Pupy is under the BSD 3-Clause license. see the LICENSE file at the root of the project for the detailed licence terms
 
-import sys, logging
+__all__ = ( 'PupyTCPServer', 'PupyUDPServer' )
+
+import logging
 
 from rpyc.utils.server import ThreadedServer
 from rpyc.utils.authenticators import AuthenticationError
-from rpyc.utils.registry import UDPRegistryClient
-from rpyc.core.stream import Stream
-from buffer import Buffer
 
 import socket
-import errno
-import random
 
 from Queue import Queue, Empty
-from threading import Thread, RLock
+from threading import Thread
 
-from streams.PupySocketStream import addGetPeer, PupyChannel
+from streams.PupySocketStream import PupyChannel
 from network.lib.connection import PupyConnection, PupyConnectionThread
 
-from network.lib.igd import IGDClient, UPNPError
+from network.lib.igd import UPNPError
 
 class PupyTCPServer(ThreadedServer):
     def __init__(self, *args, **kwargs):
@@ -41,14 +38,27 @@ class PupyTCPServer(ThreadedServer):
 
         if 'igd' in kwargs:
             self.igd = kwargs['igd']
+            self.external = kwargs.get('external', 'igd')
             del kwargs['igd']
+        else:
+            self.external = kwargs.get('external', kwargs.get('hostname'))
 
-        try:
-            ping = self.pupy_srv.config.get('pupyd', 'ping')
-            self.ping = ping and ping not in (
-                '0', '-1', 'N', 'n', 'false', 'False', 'no', 'No'
-            )
-        except:
+        if 'external' in kwargs:
+            del kwargs['external']
+
+        self.external_port = kwargs.get('external_port', kwargs.get('port'))
+        if 'external_port' in kwargs:
+            del kwargs['external_port']
+
+        if self.pupy_srv:
+            try:
+                ping = self.pupy_srv.config.get('pupyd', 'ping')
+                self.ping = ping and ping not in (
+                    '0', '-1', 'N', 'n', 'false', 'False', 'no', 'No'
+                )
+            except:
+                self.ping = False
+        else:
             self.ping = False
 
         if self.ping:
@@ -57,7 +67,11 @@ class PupyTCPServer(ThreadedServer):
             except:
                 self.ping_interval = 2
 
-            self.ping_timeout = self.pupy_srv.config.get('pupyd', 'ping_interval')
+            if self.pupy_srv:
+                self.ping_timeout = self.pupy_srv.config.get(
+                    'pupyd', 'ping_interval')
+            else:
+                self.ping_timeout = self.ping_interval * 10
         else:
             self.ping_interval = None
             self.ping_timeout = None
@@ -69,22 +83,24 @@ class PupyTCPServer(ThreadedServer):
 
         ThreadedServer.__init__(self, *args, **kwargs)
 
-        if not self.igd:
+        if self.igd and self.igd.available and self.external != self.host:
             try:
-                self.igd = IGDClient()
-            except UPNPError as e:
-                pass
-
-        if self.igd and self.igd.available:
-            try:
-                self.igd.AddPortMapping(self.port, 'TCP', self.port)
+                self.igd.AddPortMapping(
+                    self.external_port,
+                    'TCP',
+                    self.port,
+                    intIP=self.host if self.host and not self.host in (
+                        '', '0.0.0.0', 'igd'
+                    ) else None,
+                    desc='pupy'
+                )
                 self.igd_mapping = True
             except UPNPError as e:
                 self.logger.warn(
                     "Couldn't create IGD mapping: {}".format(e.description))
 
 
-    def _setup_connection(self, lock, sock, queue):
+    def _setup_connection(self, sock, queue):
         '''Authenticate a client and if it succeeds, wraps the socket in a connection object.
         Note that this code is cut and paste from the rpyc internals and may have to be
         changed if rpyc evolves'''
@@ -111,10 +127,10 @@ class PupyTCPServer(ThreadedServer):
             self.logger.debug('{}:{} Authenticated. Starting connection'.format(h, p))
 
             connection = PupyConnection(
-                lock, self.pupy_srv,
+                self.pupy_srv,
                 self.service,
                 PupyChannel(stream),
-                ping=self.ping_interval,
+                ping=stream.KEEP_ALIVE_REQUIRED or self.ping_interval,
                 timeout=self.ping_timeout,
                 config=config
             )
@@ -126,9 +142,8 @@ class PupyTCPServer(ThreadedServer):
 
     def _authenticate_and_serve_client(self, sock):
         queue = Queue(maxsize=1)
-        lock = RLock()
 
-        authentication = Thread(target=self._setup_connection, args=(lock, sock, queue))
+        authentication = Thread(target=self._setup_connection, args=(sock, queue))
         authentication.daemon = True
         authentication.start()
 
@@ -142,25 +157,17 @@ class PupyTCPServer(ThreadedServer):
             self.logger.debug('{}:{} Wait for authentication result'.format(h, p))
             connection, wrapper, credentials = queue.get(block=True, timeout=60)
             self.logger.debug('{}:{} Wait complete: {}'.format(h, p, connection))
-            if connection:
+            if connection and connection._local_root:
                 self.logger.debug('{}:{} Initializing service...')
-                connection._init_service()
-                self.logger.debug('{}:{} Initializing service... complete. Locking')
-                with lock:
-                    self.logger.debug('{}:{} Serving main loop. Inactive: {}'.format(
-                        h, p, connection.inactive))
+                connection.init()
 
-                    interval, timeout = connection.get_pings()
-
-                    while not connection.closed:
-                        connection.serve(interval or 10)
-                        if interval:
-                            connection.ping(timeout=timeout)
+                self.logger.debug('Bind server. Serving ...')
+                connection.loop()
 
         except Empty:
             self.logger.debug('{}:{} Timeout'.format(h, p))
 
-        except EOFError, TypeError:
+        except (EOFError, TypeError):
             pass
 
         finally:
@@ -180,30 +187,40 @@ class PupyTCPServer(ThreadedServer):
         ThreadedServer.close(self)
         if self.igd_mapping:
             try:
-                self.igd.DeletePortMapping(self.port, 'TCP')
+                self.igd.DeletePortMapping(self.external_port, 'TCP')
             except Exception as e:
                 self.logger.info('IGD Exception: {}/{}'.format(type(e), e))
 
 
 class PupyUDPServer(object):
-    def __init__(self, service, **kwargs):
-        if not "stream" in kwargs:
-            raise ValueError("missing stream_class argument")
-        if not "transport" in kwargs:
-            raise ValueError("missing transport argument")
-        self.stream_class=kwargs["stream"]
-        self.transport_class=kwargs["transport"]
-        self.transport_kwargs=kwargs["transport_kwargs"]
-        self.pupy_srv=kwargs["pupy_srv"]
-        del kwargs["stream"]
-        del kwargs["transport"]
-        del kwargs["transport_kwargs"]
-        del kwargs["pupy_srv"]
+    REQUIRED_KWARGS = [
+        'stream', 'transport', 'transport_kwargs',
+        'pupy_srv', 'port'
+    ]
 
-        ping = self.pupy_srv.config.get('pupyd', 'ping')
-        self.ping = ping and ping not in (
-            '0', '-1', 'N', 'n', 'false', 'False', 'no', 'No'
-        )
+    def __init__(self, service, **kwargs):
+        self.kcp = __import__('kcp')
+        self.pupy_srv = None
+        self.port = None
+        self.logger = None
+        self.stream = None
+        self.transport = None
+        self.transport_kwargs = None
+
+        for param in self.REQUIRED_KWARGS:
+            if not param in kwargs:
+                raise ValueError('missing {} argument'.format(param))
+
+            setattr(self, param, kwargs[param])
+            del kwargs[param]
+
+        if self.pupy_srv:
+            ping = self.pupy_srv.config.get('pupyd', 'ping')
+            self.ping = ping and ping not in (
+                '0', '-1', 'N', 'n', 'false', 'False', 'no', 'No'
+            )
+        else:
+            self.ping = False
 
         if self.ping:
             try:
@@ -211,103 +228,204 @@ class PupyUDPServer(object):
             except:
                 self.ping_interval = 2
 
-            self.ping_timeout = self.pupy_srv.config.get('pupyd', 'ping_interval')
+            if self.pupy_srv:
+                self.ping_timeout = self.pupy_srv.config.get('pupyd', 'ping_interval')
+            else:
+                self.ping_timeout = self.ping_interval * 10
         else:
             self.ping_interval = None
             self.ping_timeout = None
 
-        self.authenticator=kwargs.get("authenticator", None)
-        self.protocol_config=kwargs.get("protocol_config", {})
-        self.service=service
+        self.authenticator = kwargs.get('authenticator', None)
+        self.protocol_config = kwargs.get('protocol_config', {})
+        self.service = service
 
-        self.active=False
-        self.clients={}
-        self.sock=None
-        self.hostname=kwargs['hostname']
-        self.port=kwargs['port']
+        self.active = False
+        self.clients = {}
+        self.sock = None
+        self.host = kwargs.get('host') or kwargs.get('hostname')
+
+        self.igd_mapping = False
+        self.igd = None
+
+        if 'igd' in kwargs:
+            self.igd = kwargs['igd']
+            del kwargs['igd']
+            self.external = kwargs.get('external', 'igd')
+        else:
+            self.external = self.host
+
+        if 'external' in kwargs:
+            del kwargs['external']
+
+        self.external_port = kwargs.get('external_port', self.port)
+        if 'external_port' in kwargs:
+            del kwargs['external_port']
+
+        if self.igd and self.igd.available and self.external != self.host:
+            try:
+                self.igd.AddPortMapping(
+                    self.external_port,
+                    'UDP',
+                    self.port,
+                    intIP=self.host if self.host and not self.host in (
+                        '', '0.0.0.0', 'igd'
+                    ) else None,
+                    desc='pupy'
+                )
+                self.igd_mapping = True
+            except UPNPError as e:
+                self.logger.warn(
+                    "Couldn't create IGD mapping: {}".format(e.description))
+
+        self.LONG_SLEEP_INTERRUPT_TIMEOUT = 5
+        self.listen()
+
+    @property
+    def stream_class(self):
+        return self.stream
+
+    @property
+    def transport_class(self):
+        return self.transport
 
     def listen(self):
-        s=None
-        if not self.hostname:
-            self.hostname=None
-        last_exc=None
-        for res in socket.getaddrinfo(self.hostname, self.port, socket.AF_UNSPEC, socket.SOCK_DGRAM, 0, socket.AI_PASSIVE):
+        s = None
+        if not self.host:
+            self.host = None
+
+        last_exc = None
+        for res in socket.getaddrinfo(
+                self.host, self.port, socket.AF_UNSPEC,
+                socket.SOCK_DGRAM, 0, socket.AI_PASSIVE):
+
             af, socktype, proto, canonname, sa = res
+
             try:
-                s = socket.socket(af, socktype, proto)
+                s = socket.socket(af, socktype, 0)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             except socket.error as msg:
                 s = None
-                last_exc=msg
+                last_exc = msg
                 continue
+
             try:
                 s.bind(sa)
+
             except socket.error as msg:
                 s.close()
                 s = None
-                last_exc=msg
+                last_exc = msg
                 continue
+
             break
-        self.sock=s
+
+        self.sock = s
         if self.sock is None:
-            raise last_exc
-
-    def accept(self):
-        try:
-            data, addr = self.sock.recvfrom(40960)
-            if data:
-                self.dispatch_data(data, addr)
+            if last_exc is None:
+                raise RuntimeError('Socket creation failed for unknown reason')
             else:
-                self.clients[addr].close()
-        except Exception as e:
-            logging.error(e)
+                raise last_exc
 
-    def dispatch_data(self, data_received, addr):
-        host, port=addr[0], addr[1]
-        if addr not in self.clients:
-            logging.info("new client connected : %s:%s"%(host, port))
-            config = dict(self.protocol_config, credentials=None, connid="%s:%d"%(host, port))
-            if self.authenticator:
-                try:
-                    sock, credentials = self.authenticator(data_received)
-                    config["credentials"]=credentials
-                except AuthenticationError:
-                    logging.info("failed to authenticate, rejecting data")
-                    raise
-            self.clients[addr] = self.stream_class(
-                (self.sock, addr), self.transport_class, self.transport_kwargs, client_side=False
-            )
+        self.sock.setblocking(0)
+        self.dispatcher = self.kcp.KCPDispatcher(
+            self.sock.fileno(), 0,
+            timeout=self.LONG_SLEEP_INTERRUPT_TIMEOUT * 1000
+        )
 
-            t = PupyConnectionThread(
-                self.pupy_srv,
-                self.service,
-                Channel(self.clients[addr]),
-                ping=self.ping_interval,
-                timeout=self.ping_timeout,
-                config=config
-            )
-            t.daemon=True
-            t.start()
-        with self.clients[addr].downstream_lock:
-            self.clients[addr].buf_in.write(data_received)
-            self.clients[addr].transport.downstream_recv(self.clients[addr].buf_in)
+    def on_close(self, addr):
+        self.clients[addr].wake()
+        del self.clients[addr]
+        self.dispatcher.delete(addr)
+
+    def new(self, addr, ckcp):
+        logging.info("new client connected: " + addr)
+
+        host, port = addr.rsplit(':', 1)
+        port = int(port)
+
+        config = dict(
+            self.protocol_config,
+            credentials=None,
+            connid=addr
+        )
+
+        client = self.stream(
+            (
+                self.sock, (
+                    host, port
+                ),
+                ckcp,
+            ),
+            self.transport,
+            self.transport_kwargs,
+            client_side=False,
+            close_cb=self.on_close,
+            lsi=self.LONG_SLEEP_INTERRUPT_TIMEOUT
+        )
+
+        logging.debug('Request pings: {}'.format(
+            client.KEEP_ALIVE_REQUIRED or self.ping_interval))
+
+        connthread = PupyConnectionThread(
+            self.pupy_srv,
+            self.service,
+            PupyChannel(client),
+            ping=client.KEEP_ALIVE_REQUIRED or self.ping_interval,
+            timeout=self.ping_timeout,
+            config=config
+        )
+        connthread.start()
+        return connthread.connection
 
     def start(self):
-        self.listen()
         self.active=True
         try:
             while self.active:
-                self.accept()
+                try:
+                    new, updated, failed = self.dispatcher.dispatch()
+                    for f, kcp in new:
+                        self.clients[f] = self.new(f, kcp)
+
+                    for f in updated:
+                        x = self.clients[f].consume()
+                        if not x:
+                            failed.add(f)
+
+                    for f in failed:
+                        self.clients[f].close()
+
+                    for f in self.dispatcher.keys():
+                        if f not in updated:
+                            self.clients[f].wake()
+
+                except Exception as e:
+                    logging.exception(e)
+                    raise
+
+            for f in self.clients.keys():
+                self.clients[f].close()
+
         except EOFError:
+            logging.error("EOF")
             pass # server closed by another thread
         except KeyboardInterrupt:
             print("")
             print "keyboard interrupt!"
+        except Exception, e:
+            logging.exception('Unknown exception {}: {}'.format(type(e), e))
         finally:
             logging.info("server has terminated")
             self.close()
 
     def close(self):
-        self.active=False
+        self.active = False
+
         if self.sock:
             self.sock.close()
+
+        if self.igd_mapping:
+            try:
+                self.igd.DeletePortMapping(self.external_port, 'UDP')
+            except Exception as e:
+                logging.info('IGD Exception: {}/{}'.format(type(e), e))

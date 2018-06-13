@@ -59,6 +59,8 @@ PyObject *, PyBool_FromLong, (long)
 int, Py_VerboseFlag
 int, Py_NoSiteFlag
 int, Py_OptimizeFlag
+int, Py_NoUserSiteDirectory
+int, Py_DontWriteBytecodeFlag
 int, Py_IgnoreEnvironmentFlag
 PyObject *, PyObject_Str, (PyObject *)
 PyObject *, PyList_New, (Py_ssize_t)
@@ -71,6 +73,10 @@ void, PyEval_InitThreads, (void)
 PyObject *, PyErr_NewException, (char *name, PyObject *base, PyObject *dict)
 int, PyModule_AddObject, (PyObject *, const char *, PyObject *)
 int, PyModule_AddStringConstant, (PyObject *module, const char *name, const char *value)
+
+PyObject*, PyDict_New, ()
+PyObject*, PyString_FromStringAndSize, (const char *v, Py_ssize_t len)
+int, PyDict_SetItem, (PyObject *p, PyObject *key, PyObject *val)
 '''.strip().splitlines()
 
 

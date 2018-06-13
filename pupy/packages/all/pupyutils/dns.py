@@ -3,7 +3,7 @@ import socket
 
 def getIP(domain):
     """
-    This method returns the first IP address string 
+    This method returns the first IP address string
     that responds as the given domain name
     """
     try:
@@ -18,7 +18,7 @@ def getIPx(domain):
     as the given domain name
     """
     try:
-        return socket.gethostbyname_ex(domain)[2]
+        return list(set(socket.gethostbyname_ex(domain)[2]))
     except Exception:
         return False
 #
@@ -39,19 +39,21 @@ def getAlias(domain):
     """
     try:
         data = socket.gethostbyname_ex(domain)
-        alias = repr(data[1])
-        return alias
+        return list(data[1])
     except Exception:
         return False
 
 def launch_dns_ip_resolver(ip_or_domain):
-    functions = { 'IP': {'function': getIP, 'result': ''}, 
-                 'IPx': {'function': getIPx, 'result': ''},
-                'Host': {'function': getHost, 'result': ''},
-                'Alias': {'function': getAlias, 'result': ''}
-        }
+    functions = {
+        'IP': {'function': getIP, 'result': ''},
+        'IPx': {'function': getIPx, 'result': ''},
+        'Host': {'function': getHost, 'result': ''},
+        'Alias': {'function': getAlias, 'result': ''}
+    }
 
-    for function in functions:
-        functions[function]['result'] = functions[function]['function'](ip_or_domain)
+    return {
+        k:v['function'](ip_or_domain) for k,v in functions.iteritems()
+    }
 
-    return functions
+def launch_reverse_ip_resolver(ip):
+    return getHost(ip)

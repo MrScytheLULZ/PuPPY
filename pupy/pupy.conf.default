@@ -1,14 +1,23 @@
 [pupyd]
 #listen on all interfaces by default
-#address = 192.168.0.1
-#external = 1.2.3.4
-#external_port = 444
+# address = 192.168.0.1
+
+## Default external address for all transports
+# external = 1.2.3.4
+
 transport = ssl
-port = 443
 ipv6 = true
 logs = false
+webserver = false
 
-#igd=True allow pupy to make UPNP requests to get you external IP.
+#Multiple listeners are allowed. Example
+#listen = ssl,kc4,websocket
+listen = ssl
+
+#igd=True allow pupy to make IGD/UPNP requests to get you external IP and
+#    add mappings to your local machine from outside
+#If enabled, pupy will implicitly expect that pupysh sits behind NAT
+#igd = http://ip[:port] will disable autodetect
 igd = false
 
 #httpd=true wraps your transport in a HTTP transport.
@@ -19,12 +28,32 @@ dnscnc = false
 recursor = false
 
 # allow requests to services like ifconfig.co to automatically retrieve public IP
+# you should enable this if you planning to use IGD/UPNP
 allow_requests_to_external_services = false
 
 use_gnome_keyring=false
 
 ping = 0
 ping_timeout = 2
+
+# Enable modules which are marked as QA_DANGEROUS
+# These modules may cause the pupy hang or require manual changes
+enable_dangerous_modules = false
+
+[listeners]
+# Default ports and args
+# Ensure ports are different for all enabled listeners
+# Or remove listener(s) from pupyd.listen parameter
+ssl = 443=8443
+obfs3 = 9090
+rsa = 9091
+ec4 = 80=1234
+kc4 = 123=1234
+tcp_cleartext = 80=1234
+udp_cleartext = 123=1234
+websocket = 80=8081
+http = 80=8080
+ecm = 1235
 
 [ssl]
 client_cert_required = true
@@ -52,11 +81,15 @@ prefer_workdir = no
 downloads = data/downloads/%c
 memstrings = data/memstrings/%c
 searches = data/searches/%c
-screenshots = data/screenshots/%c
+screenshots = data/screenshots/%c/%t
+pcaps = data/pcaps/%c/%t.pcap
 logs = data/logs/%c/%t-%M
 creds = data/creds
 crypto = crypto
 wwwroot = data/wwwroot
+records = data/%c
+keystrokes = data/keylogger/%c/%t.log
+mouseshots = data/mouselogger/%c/%w-%t.png
 
 [on_connect]
 #run_module1 = gather/keylogger start
@@ -80,9 +113,9 @@ ps = ps
 migrate = migrate
 shell=interactive_shell
 kill = process_kill
-pwd = pyexec -c 'import os;print os.getcwd()'
 #tasklist = shell_exec 'tasklist /v'
 mount = drives
+du = download -S
 
 [rubber_ducky]
 #path to the encoder.jar file of Rubber-Ducky project (see https://github.com/hak5darren/USB-Rubber-Ducky/blob/master/Encoder/encoder.jar)

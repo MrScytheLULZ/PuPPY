@@ -1,43 +1,43 @@
 # -*- coding: utf-8 -*-
 from pupylib.PupyModule import *
+from pupylib.PupyOutput import Table
 from pupylib.utils.term import colorize
-from modules.lib.utils.shell_exec import shell_exec
-from pupylib.utils.rpyc_utils import obtain
+from modules.lib import size_human_readable
 
 __class_name__="Drives"
 
-@config(category='admin', compatibilities=['windows', 'linux', 'darwin'])
+@config(category='admin', compatibilities=['windows', 'posix', 'darwin'])
 class Drives(PupyModule):
     """ List valid drives in the system """
 
     dependencies={
+        'all': [ 'psutil' ],
+        'posix': [ 'mount' ],
         'windows': [
             'win32api', 'win32com', 'pythoncom',
             'winerror', 'wmi', 'pupwinutils.drives'
         ],
-        'linux': [ 'mount' ]
     }
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(
             prog="drives",
-            description=self.__doc__
+            description=cls.__doc__
         )
 
     def run(self, args):
-        if self.client.is_windows():
-            self.stdout.write(
-                self.client.conn.modules['pupwinutils.drives'].list_drives()
-            )
-
-        elif self.client.is_posix():
+        ok = False
+        if self.client.is_posix():
             tier1 = ( 'network', 'fuse', 'dm', 'block', 'vm' )
-            rmount = self.client.conn.modules['mount']
-            ros = self.client.conn.modules['os']
 
-            mountinfo = obtain(rmount.mounts())
-            uid = ros.getuid()
-            gid = ros.getgid()
+            mounts = self.client.remote('mount', 'mounts')
+            getuid = self.client.remote('os', 'getuid')
+            getgid = self.client.remote('os', 'getgid')
+
+            mountinfo = mounts()
+            uid = getuid()
+            gid = getgid()
 
             option_colors = {
                 'rw': 'yellow',
@@ -159,7 +159,37 @@ class Drives(PupyModule):
 
                 output.append('')
 
-            self.stdout.write('\n'.join(output))
+            self.log('\n'.join(output))
 
-        elif self.client.is_darwin():
-            self.log(shell_exec(self.client, 'df -H'))
+            ok = True
+
+        elif self.client.is_windows():
+            try:
+                list_drives = self.client.remote('pupwinutils.drives', 'list_drives')
+                self.log(list_drives())
+                ok = True
+            except:
+                self.warning('WMI failed')
+                pass
+
+        if not ok:
+            list_drives = self.client.remote('pupyps', 'drives')
+            drives = list_drives()
+
+            formatted_drives = []
+
+            for drive in drives:
+                formatted_drives.append({
+                    'DEV': drive['device'],
+                    'MP': drive['mountpoint'],
+                    'FS': drive['fstype'],
+                    'OPTS': drive['opts'],
+                    'USED': (
+                        '{}% ({}/{})'.format(
+                            drive['percent'],
+                            size_human_readable(drive['used']),
+                            size_human_readable(drive['total']))
+                    ) if ( 'used' in drive and 'total' in drive ) else '?'
+                })
+
+            self.log(Table(formatted_drives, ['DEV', 'MP', 'FS', 'OPTS', 'USED']))

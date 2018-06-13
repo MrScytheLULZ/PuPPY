@@ -22,32 +22,38 @@ __class_name__="PExec"
 class PExec(PupyModule):
     """ Execute shell commands non-interactively on a remote system in background using popen"""
 
-    pipe = None
-    completed = False
-    terminate = threading.Event()
+    terminate_pipe = None
+    terminated = False
+
     updl = re.compile('\^([^\^]+)\^([<>])([^\^]+)\^')
     # daemon = True
 
     dependencies = [ "pupyutils.safepopen" ]
+    io = REQUIRE_STREAM
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog='pexec', description=self.__doc__)
-        self.arg_parser.add_argument(
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog='pexec', description=cls.__doc__)
+        cls.arg_parser.add_argument(
             '-n',
             action='store_true',
             help='Don\'t catch stderr',
         )
-        self.arg_parser.add_argument(
+        cls.arg_parser.add_argument(
             '-N',
             action='store_true',
             help='Don\'t receive stdout (read still be done on the other side)',
         )
-        self.arg_parser.add_argument(
+        cls.arg_parser.add_argument(
             '-s',
             action='store_true',
             help='Start in shell',
         )
-        self.arg_parser.add_argument(
+        cls.arg_parser.add_argument(
+            '-S', '--set-uid',
+            help='Set UID (Posix only)',
+        )
+        cls.arg_parser.add_argument(
             'arguments',
             nargs=argparse.REMAINDER,
             help='CMD args. You can use ^/local/path^[>|<]/remote/path^ '
@@ -65,13 +71,13 @@ class PExec(PupyModule):
         to_download = []
         to_delete = []
 
-        ros = None
+        rexpandvars = self.client.remote('os.path', 'expandvars')
+        rexists = self.client.remote('os.path', 'exists')
+        rchmod = self.client.remote('os', 'chmod')
+        safe_exec = self.client.remote('pupyutils.safepopen', 'safe_exec', False)
 
         for i, arg in enumerate(cmdargs):
             for local, direction, remote in self.updl.findall(arg):
-                if not ros:
-                    ros = self.client.conn.modules['os']
-
                 if local == '$SELF$':
                     platform = self.client.platform
                     if not platform in ('windows', 'linux'):
@@ -80,7 +86,7 @@ class PExec(PupyModule):
                 else:
                     xlocal = os.path.expandvars(local)
 
-                xremote = ros.path.expandvars(remote)
+                xremote = rexpandvars(remote)
 
                 if direction == '<':
                     to_download.append((xremote, xlocal))
@@ -133,7 +139,7 @@ class PExec(PupyModule):
                 self.info('Upload {} -> {}'.format(local, remote))
                 upload(self.client.conn, local, remote)
 
-            ros.chmod(remote, mode)
+            rchmod(remote, mode)
 
         cmdenv = {
             'stderr': (None if args.n else subprocess.STDOUT),
@@ -158,50 +164,45 @@ class PExec(PupyModule):
                     )
                 ]
 
-        self.pipe = self.client.conn.modules[
-            'pupyutils.safepopen'
-        ].SafePopen(cmdargs, **cmdenv)
-
-        if hasattr(self.job, 'id'):
-            self.success('Started at {}): '.format(
-                datetime.datetime.now()))
-
-        self.success('Command: {}'.format(' '.join(
-            x if not ' ' in x else "'" + x + "'" for x in cmdargs
-        ) if not cmdenv['shell'] else cmdargs))
+        if args.set_uid:
+            cmdenv.update({
+                'suid': args.set_uid
+            })
 
         close_event = threading.Event()
 
         def on_read(data):
             self.stdout.write(data)
 
-        def on_close():
-            close_event.set()
+        self.terminate_pipe, get_returncode = safe_exec(
+            None if args.N else on_read,
+            close_event.set,
+            tuple(cmdargs), **cmdenv)
 
-        self.pipe.execute(on_close, None if args.N else on_read)
-        while not ( self.terminate.is_set() or close_event.is_set() ):
-            close_event.wait()
+        if hasattr(self.job, 'id'):
+            self.success('Started at {}): '.format(
+                datetime.datetime.now()))
 
-        if self.pipe.returncode == 0:
+        close_event.wait()
+
+        retcode = get_returncode()
+
+        if retcode == 0:
             self.success('Successful at {}: '.format(datetime.datetime.now()))
         else:
             self.error(
-                'Ret: {} at {}'.format(self.pipe.returncode, datetime.datetime.now()))
+                'Ret: {} at {}'.format(retcode, datetime.datetime.now()))
 
         for remote, local in to_download:
-            if ros.path.exists(remote):
+            if rexists(remote):
                 self.info('Download {} -> {}'.format(remote, local))
                 download(self.client.conn, remote, local)
             else:
                 self.error('Remote file {} not exists (scheduled for download)'.format(remote))
 
-        if hasattr(self.job, 'id'):
-            self.job.pupsrv.handler.display_srvinfo('(Job id: {}) Command {} completed'.format(
-                self.job.id, cmdargs))
-
     def interrupt(self):
-        if not self.completed and self.pipe:
+        if not self.terminated and self.terminate_pipe:
+            self.terminated = True
             self.error('Stopping command')
-            self.pipe.terminate()
-            self.terminate.set()
+            self.terminate_pipe()
             self.error('Stopped')

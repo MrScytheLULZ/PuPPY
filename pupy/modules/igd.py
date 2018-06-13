@@ -193,12 +193,13 @@ class IGDCMDClient(object):
 class IGDClient(PupyModule):
     """ UPnP IGD Client """
 
-    def init_argparse(self):
+    @classmethod
+    def init_argparse(cls):
         cli = IGDCMDClient()
 
         parser = PupyArgumentParser(
             prog='igdc',
-            description=self.__doc__
+            description=cls.__doc__
         )
         parser.add_argument('-d', '--DEBUG', action='store_true',
                             help='enable DEBUG output')
@@ -402,13 +403,15 @@ class IGDClient(PupyModule):
         parser_chkph.add_argument('uid', type=int, help='UniqueID of the pinhole')
         parser_chkph.set_defaults(func=cli.chkPH)
 
-        self.arg_parser = parser
-        self.cli = cli
+        cls.arg_parser = parser
+        cls.cli = cli
 
     def run(self, args):
-        igdc = self.client.conn.modules['network.lib.igd'].IGDClient
-        UPNPError = self.client.conn.modules['network.lib.igd'].UPNPError
+        igdc = self.client.remote('network.lib.igd', 'IGDClient', False)
+        UPNPError = self.client.remote('network.lib.igd', 'UPNPError', False)
+
         self.cli.init(igdc, args, self.log)
+
         if not self.cli.igdc.available:
             self.error('IGD: Not found in LAN')
             return

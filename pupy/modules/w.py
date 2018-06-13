@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
 from pupylib.PupyModule import *
-from pupylib.PupyCmd import PupyCmd
-from pupylib.utils.rpyc_utils import obtain
-from pupylib.utils.term import colorize
-from modules.lib.utils.shell_exec import shell_exec
+from pupylib.PupyOutput import Color
 from datetime import datetime, timedelta
 
 import logging
@@ -19,13 +16,15 @@ class WModule(PupyModule):
     dependencies = [ 'pupyps' ]
     is_module=False
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog="w", description=self.__doc__)
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog="w", description=cls.__doc__)
 
     def run(self, args):
         try:
-            data = obtain(self.client.conn.modules.pupyps.users())
+            users = self.client.remote('pupyps', 'users')
 
+            data = users()
             tablein = []
 
             for user, hosts in reversed(sorted(data.iteritems())):
@@ -40,13 +39,13 @@ class WModule(PupyModule):
                             )
 
                         object = {
-                            'HOST': colorize(host, color),
-                            'USER': colorize(
+                            'HOST': Color(host, color),
+                            'USER': Color(
                                 user,
                                 "yellow" if user in ADMINS else (
-                                    "green" if session.get('me') else "")
+                                    "green" if session.get('me') else color)
                             ),
-                            'LOGIN': colorize(
+                            'LOGIN': Color(
                                 str(datetime.fromtimestamp(int(session['started']))), color
                             ),
                         }
@@ -61,16 +60,16 @@ class WModule(PupyModule):
                                 what = ''
 
                             object.update({
-                                'IDLE': colorize(
+                                'IDLE': Color(
                                     str(timedelta(seconds=session['idle'])), color
                                 ) if session.get('idle') else '',
-                                'PID': colorize(str(session.get('pid', '')), color),
-                                'WHAT': colorize(what[:30]+'…' if len(what) > 30 else what, color)
+                                'PID': Color(str(session.get('pid', '')), color),
+                                'WHAT': Color(what[:30]+'…' if len(what) > 30 else what, color)
                             })
 
                         tablein.append(object)
 
-            self.stdout.write(PupyCmd.table_format(tablein))
+            self.table(tablein)
 
         except Exception, e:
             logging.exception(e)

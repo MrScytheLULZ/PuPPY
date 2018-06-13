@@ -5,13 +5,67 @@ import getpass
 import uuid
 import sys
 import os
+import sys
 import locale
+import logging
+
+import encodings
+
+# Restore write/stdout/stderr
+
+if not hasattr(os, 'real_write'):
+    if type(os.write).__name__ == 'builtin_function_or_method':
+        os.real_write = os.write
+
+if not hasattr(sys, 'real_stdout') and type(sys.stdout) == file:
+    sys.real_stdout = sys.stdout
+
+if not hasattr(sys, 'real_stderr') and type(sys.stderr) == file:
+    sys.real_stderr = sys.stderr
+
+if not hasattr(sys, 'real_stdin') and type(sys.stdin) == file:
+    sys.real_stdin = sys.stdin
+
+if not hasattr(os, 'stdout_write'):
+    def stdout_write(fd, s):
+        if fd == 1:
+            return sys.stdout.write(s)
+        elif fd == 2:
+            return sys.stderr.write(s)
+        else:
+            return os.real_write(fd, s)
+
+    os.stdout_write = stdout_write
+
+# Remove IDNA module if it was not properly loaded
+if hasattr(encodings, 'idna') and not hasattr(encodings.idna, 'getregentry'):
+    del sys.modules['encodings.idna']
+    if 'idna' in encodings._cache:
+        del encodings._cache['idna']
 
 os_encoding = locale.getpreferredencoding() or "utf8"
 
 if sys.platform == 'win32':
     from _winreg import *
     import ctypes
+
+def redirect_stdo(stdout, stderr):
+    sys.stdout = stdout
+    sys.stderr = stderr
+    os.write = os.stdout_write
+
+def redirect_stdio(stdin, stdout, stderr):
+    sys.stdin = stdin
+    redirect_stdo(stdout, stderr)
+
+def reset_stdo():
+    sys.stdout = sys.real_stdout
+    sys.stderr = sys.real_stderr
+    os.write = os.real_write
+
+def reset_stdio():
+    sys.stdin = sys.real_stdin
+    reset_stdo()
 
 def get_integrity_level():
     '''from http://www.programcreek.com/python/example/3211/ctypes.c_long'''
@@ -177,16 +231,17 @@ def GetUserName():
     return lpBuffer.value
 
 def get_uuid():
-    user=None
-    node=None
-    plat=None
-    release=None
-    version=None
-    machine=None
-    macaddr=None
-    pid=None
-    proc_arch=None
-    proc_path=sys.executable
+    user = None
+    hostname = None
+    node = None
+    plat = None
+    release = None
+    version = None
+    machine = None
+    macaddr = None
+    pid = None
+    proc_arch = None
+    proc_path = sys.executable
     uacLevel = None
     integrity_level = None
     try:
@@ -197,11 +252,12 @@ def get_uuid():
                 encoding=os_encoding
             ).encode("utf8")
     except Exception as e:
-        user=str(e)
+        logging.exception(e)
+        user='?'
         pass
 
     try:
-        node = platform.node().decode(
+        hostname = platform.node().decode(
             encoding=os_encoding
         ).encode("utf8")
     except Exception:
@@ -213,7 +269,31 @@ def get_uuid():
         pass
 
     try:
-        plat=platform.system()
+        plat = platform.system()
+        if plat == 'Java':
+            # Jython!
+            if hasattr(sys, 'system_java'):
+                plat = sys.system_java
+            else:
+                jsystem = sys.platform.getshadow()
+
+                # Fix this crap
+                setattr(sys, 'platform', jsystem)
+
+                if jsystem == 'linux2':
+                    plat = 'Linux+Java'
+                elif jsystem == 'win32':
+                    plat = 'Windows+Java'
+                else:
+                    plat = jsystem + '+Java'
+
+                setattr(sys, 'system_java', plat)
+
+                import ctypes.util
+                plat += '+JyNI'
+
+                setattr(sys, 'system_java', plat)
+
     except Exception:
         pass
 
@@ -248,8 +328,8 @@ def get_uuid():
         pass
 
     try:
-        macaddr=uuid.getnode()
-        macaddr=':'.join(("%012X" % macaddr)[i:i+2] for i in range(0, 12, 2))
+        node = '{:012x}'.format(uuid.getnode())
+        macaddr = ':'.join(node[i:i+2] for i in range(0, 12, 2))
     except Exception:
         pass
 
@@ -265,12 +345,14 @@ def get_uuid():
 
     return {
         'user': user,
-        'hostname': node,
+        'hostname': hostname,
+        'node': node,
         'platform': plat,
         'release': release,
         'version': version,
         'os_arch': machine,
         'os_name': osname,
+        'node': node,
         'macaddr': macaddr,
         'pid': pid,
         'proc_arch': proc_arch,

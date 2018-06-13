@@ -9,10 +9,9 @@ paramiko==2.0.2
 tinyec
 psutil
 netifaces
-m2crypto
 pylzma
-mss==2.0.22
 colorama
+mss
 pyOpenSSL
 scapy
 impacket
@@ -26,3 +25,11 @@ pygments
 requests
 tornado
 keyboard
+poster
+win_inet_pton
+scandir
+msgpack
+hexdump
+M2Crypto
+fusepy
+-e external/pykcp

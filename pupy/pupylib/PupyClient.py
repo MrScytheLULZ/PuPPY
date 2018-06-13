@@ -3,35 +3,63 @@
 # Copyright (c) 2015, Nicolas VERDIER (contact@n1nj4.eu)
 # All rights reserved.
 #
-# Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
 #
-# 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+# 1. Redistributions of source code must retain the above copyright notice,
+# this list of conditions and the following disclaimer.
 #
-# 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
 #
-# 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+# 3. Neither the name of the copyright holder nor the names of its contributors
+# may be used to endorse or promote products derived from this software without
+# specific prior written permission.
 #
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE
 # --------------------------------------------------------------
-import sys, os, os.path
-import textwrap
+
 import logging
-import cPickle
+
+import zlib
+
+import msgpack
+import rpyc
+
+from threading import Lock
+from os import path
+
+from . import ROOT, HOST_SYSTEM, HOST_CPU_ARCH, HOST_OS_ARCH
 from .PupyErrors import PupyModuleError
-import traceback
-import textwrap
 from .PupyJob import PupyJob
-import imp
-import platform
+from .PupyCompile import pupycompile
+from .payloads import dependencies
+from .utils.rpyc_utils import obtain
 
-from pupylib.payloads import dependencies
-from pupylib.utils.rpyc_utils import obtain
-
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+from . import getLogger
+logger = getLogger('client')
 
 class PupyClient(object):
     def __init__(self, desc, pupsrv):
-        self.desc = desc
+        self.desc = {
+            (
+                k.encode('utf-8') if type(k) == unicode else k
+            ):(
+                v.encode('utf-8') if type(v) == unicode else v
+            ) for k,v in desc.iteritems()
+        }
+
         #alias
         self.conn = self.desc["conn"]
         self.pupsrv = pupsrv
@@ -39,22 +67,27 @@ class PupyClient(object):
         self.imported_modules = set()
         self.cached_modules = set()
         self.pupyimporter = None
-        self.has_load_dll = False
-        self.has_new_dlls = False
-        self.has_new_modules = False
+        self.load_dll = False
+        self.new_dlls = False
+        self.new_modules = False
+        self.remotes = {}
+        self.remotes_lock = Lock()
+        self.obtain_call = None
+
         self.load_pupyimporter()
 
         #to reuse impersonated handle in other modules
         self.impersonated_dupHandle = None
 
     def __str__(self):
-        return "PupyClient(id=%s, user=%s, hostname=%s, platform=%s)"%(
+        return 'PupyClient(id=%s, user=%s, hostname=%s, platform=%s)'%(
             self.desc["id"], self.desc["user"],
             self.desc["hostname"], self.desc["platform"]
         )
 
-    def __del__(self):
-        del self.desc
+    @property
+    def id(self):
+        return self.desc['id']
 
     def get_conf(self):
         dic={}
@@ -67,9 +100,10 @@ class PupyClient(object):
     def short_name(self):
         try:
             return '_'.join([
-                self.desc["platform"][0:3].lower(),
-                self.desc["hostname"],
-                self.desc["macaddr"].replace(':','')
+                self.desc['platform'][0:3].lower(),
+                self.desc['hostname'],
+                self.desc.get(
+                    'node', self.desc['macaddr'].replace(':',''))
             ])
 
         except Exception:
@@ -86,6 +120,9 @@ class PupyClient(object):
 
     def is_linux(self):
         return "linux" in self.desc["platform"].lower()
+
+    def is_java(self):
+        return "java" in self.desc["platform"].lower()
 
     def is_android(self):
         return self.desc["platform"].lower()=="android"
@@ -171,63 +208,137 @@ class PupyClient(object):
     def match_server_arch(self):
         try:
             return all([
-                self.desc['platform']==platform.system(),
-                self.desc['proc_arch']==platform.architecture()[0],
-                self.desc['os_arch']==platform.machine()
+                self.desc['platform'] == HOST_SYSTEM,
+                self.desc['proc_arch'] == HOST_CPU_ARCH,
+                self.desc['os_arch'] == HOST_OS_ARCH
             ])
 
         except Exception as e:
-            logging.error(e)
+            logger.error(e)
+
         return False
+
+    def remote(self, module, function=None, need_obtain=True):
+        remote_module = None
+        remote_function = None
+
+        with self.remotes_lock:
+            if module in self.remotes:
+                remote_module = self.remotes[module]['_']
+            else:
+                remote_module = getattr(self.conn.modules, module)
+                self.remotes[module] = {
+                    '_': remote_module
+                }
+
+            if function:
+                if function in self.remotes[module]:
+                    remote_function = self.remotes[module][function]
+                else:
+                    remote_function = getattr(self.conn.modules[module], function)
+                    self.remotes[module][function] = remote_function
+
+        if function and need_obtain:
+            if self.obtain_call:
+                return lambda *args, **kwargs: self.obtain_call(remote_function, *args, **kwargs)
+            else:
+                return lambda *args, **kwargs: obtain(remote_function(*args, **kwargs))
+
+        elif function:
+            return remote_function
+
+        else:
+            return remote_module
+
+    def remote_const(self, module, variable):
+        remote_module = None
+        remote_variable = None
+
+        with self.remotes_lock:
+            if module in self.remotes:
+                remote_module = self.remotes[module]['_']
+            else:
+                remote_module = getattr(self.conn.modules, module)
+                self.remotes[module] = {
+                    '_': remote_module
+                }
+
+            if variable in self.remotes[module]:
+                remote_variable = self.remotes[module][variable]
+            else:
+                remote_variable = obtain(getattr(self.conn.modules[module], variable))
+                self.remotes[module][variable] = remote_variable
+
+        return remote_variable
 
     def load_pupyimporter(self):
         """ load pupyimporter in case it is not """
-        if "pupyimporter" not in self.conn.modules.sys.modules:
-            pupyimporter_code=""
-            with open(os.path.join(ROOT, "packages","all","pupyimporter.py"),'rb') as f:
-                pupyimporter_code=f.read()
-            self.conn.execute(textwrap.dedent(
-            """
-            import imp
-            import sys
-            def pupyimporter_preimporter(code):
-                mod = imp.new_module("pupyimporter")
-                mod.__name__="pupyimporter"
-                mod.__file__="<memimport>\\\\pupyimporter"
-                mod.__package__="pupyimporter"
-                sys.modules["pupyimporter"]=mod
-                exec code+"\\n" in mod.__dict__
-                mod.install()
-                """))
-            self.conn.namespace["pupyimporter_preimporter"](pupyimporter_code)
 
-        self.pupyimporter = self.conn.modules.pupyimporter
+        if not self.conn.pupyimporter:
+            try:
+                self.pupyimporter = self.remote('pupyimporter')
+            except:
+                self.conn.execute('\n'.join([
+                    'import imp, sys, marshal',
+                    'mod = imp.new_module("pupyimporter")',
+                    'mod.__file__="<bootloader>/pupyimporter"',
+                    'exec marshal.loads({}) in mod.__dict__'.format(
+                        repr(pupycompile(
+                            path.join(ROOT, 'packages', 'all', 'pupyimporter.py'),
+                            'pupyimporter.py', path=True, raw=True))),
+                    'sys.modules["pupyimporter"]=mod',
+                    'mod.install()']))
 
-        try:
-            self.conn._conn.root.register_cleanup(self.pupyimporter.unregister_package_request_hook)
-            self.pupyimporter.register_package_request_hook(self.remote_load_package)
-        except:
-            pass
+                self.pupyimporter = self.remote('pupyimporter')
+        else:
+            self.pupyimporter = self.conn.pupyimporter
 
-        try:
-            self.conn._conn.root.register_cleanup(self.pupyimporter.unregister_package_error_hook)
-            self.pupyimporter.register_package_error_hook(self.remote_print_error)
-        except:
-            pass
+        if self.conn.register_remote_cleanup:
+            register_package_request_hook = rpyc.async(self.pupyimporter.register_package_request_hook)
+            register_package_error_hook = rpyc.async(self.pupyimporter.register_package_error_hook)
 
-        self.has_load_dll = hasattr(self.pupyimporter, 'load_dll')
-        self.has_new_dlls = hasattr(self.pupyimporter, 'new_dlls')
-        self.has_new_modules = hasattr(self.pupyimporter, 'new_modules')
+            self.conn.register_remote_cleanup(self.pupyimporter.unregister_package_request_hook)
+            register_package_request_hook(self.remote_load_package)
 
-        self.imported_modules = set(obtain(self.conn.modules.sys.modules.keys()))
-        self.cached_modules = set(obtain(self.pupyimporter.modules.keys()))
+            self.conn.register_remote_cleanup(self.pupyimporter.unregister_package_error_hook)
+            register_package_error_hook(self.remote_print_error)
 
-    def load_dll(self, path):
+        self.load_dll = getattr(self.pupyimporter, 'load_dll', None)
+        self.new_dlls = getattr(self.pupyimporter, 'new_dlls', None)
+        self.new_modules = getattr(self.pupyimporter, 'new_modules', None)
+        self.remote_add_package = rpyc.async(self.pupyimporter.pupy_add_package)
+        self.remote_invalidate_package = rpyc.async(self.pupyimporter.invalidate_module)
+
+        if self.conn.obtain_call:
+            def obtain_call(function, *args, **kwargs):
+                if args or kwargs:
+                    packed_args = msgpack.dumps((args, kwargs))
+                    packed_args = zlib.compress(packed_args)
+                else:
+                    packed_args = None
+
+                result = self.conn.obtain_call(function, packed_args)
+                result = zlib.decompress(result)
+                result = msgpack.loads(result)
+
+                return result
+
+            self.obtain_call = obtain_call
+
+        if self.obtain_call:
+            self.imported_modules = set(self.obtain_call(self.conn.modules.sys.modules.keys))
+            self.cached_modules = set(self.obtain_call(self.pupyimporter.modules.keys))
+        else:
+            self.imported_modules = set(obtain(self.conn.modules.sys.modules.keys()))
+            self.cached_modules = set(obtain(self.pupyimporter.modules.keys()))
+
+
+    def load_dll(self, modpath):
         """
             load some dll from memory like sqlite3.dll needed for some .pyd to work
             Don't load pywintypes27.dll and pythoncom27.dll with this. Use load_package("pythoncom") instead
         """
-        name = os.path.basename(path)
+        name = path.basename(modpath)
         if name in self.imported_dlls:
             return False
 
@@ -235,8 +346,8 @@ class PupyClient(object):
         if not buf:
             raise ImportError('Shared object {} not found'.format(name))
 
-        if has_load_dll:
-            result = pupyimporter.load_dll(name, buf)
+        if self.load_dll:
+            result = self.load_dll(name, buf)
         else:
             result = self.conn.modules.pupy.load_dll(name, buf)
 
@@ -247,7 +358,7 @@ class PupyClient(object):
 
         return True
 
-    def filter_new_modules(self, modules, dll, force=None):
+    def filter_new_modules(self, modules, dll, force=None, remote=False):
         if force is None:
             modules = set(
                 x for x in modules if not x in self.imported_modules
@@ -266,20 +377,27 @@ class PupyClient(object):
         if not modules:
             return []
 
+        if remote:
+            return modules
+
         if dll:
-            if self.has_new_dlls:
-                return self.pupyimporter.new_dlls(modules)
+            if self.new_dlls:
+                return self.new_dlls(modules)
             else:
                 return [
                     module for module in modules if not module in self.imported_dlls
                 ]
         else:
-            if self.has_new_modules :
-                new_modules = self.pupyimporter.new_modules(modules)
+            if self.new_modules:
+                new_modules = self.new_modules(modules)
             else:
                 new_modules = [
                     module for module in modules if not self.pupyimporter.has_module(module)
                 ]
+
+            for module in modules:
+                if not module in new_modules:
+                    self.imported_modules.add(module)
 
             if not force is None:
                 for module in modules:
@@ -290,7 +408,42 @@ class PupyClient(object):
             else:
                 return new_modules
 
-    def load_package(self, requirements, force=False, remote=False, new_deps=[]):
+    def invalidate_packages(self, packages):
+        if type(packages) in (str, unicode):
+            packages = [packages]
+
+        invalidated = False
+
+        with self.remotes_lock:
+            for module in packages:
+                self.pupyimporter.invalidate_module(module)
+
+                for m in self.remotes.keys():
+                    if m == module or m.startswith(module+'.'):
+                        invalidated = True
+                        del self.remotes[m]
+
+                to_remove = set()
+                for m in self.imported_modules:
+                    if m == module or m.startswith(module+'.'):
+                        invalidated = True
+                        to_remove.add(m)
+
+                for m in to_remove:
+                    self.imported_modules.remove(m)
+
+                to_remove = set()
+                for m in self.cached_modules:
+                    if m == module or m.startswith(module+'.'):
+                        invalidated = True
+                        to_remove.add(m)
+
+                for m in to_remove:
+                    self.cached_modules.remove(m)
+
+        return invalidated
+
+    def load_package(self, requirements, force=False, remote=False, new_deps=[], honor_ignore=True):
         try:
             forced = None
             if force:
@@ -298,9 +451,9 @@ class PupyClient(object):
 
             packages, contents, dlls = dependencies.package(
                 requirements, self.platform, self.arch, remote=remote,
-                posix=self.is_posix(),
+                posix=self.is_posix(), honor_ignore=honor_ignore,
                 filter_needed_cb=lambda modules, dll: self.filter_new_modules(
-                    modules, dll, forced
+                    modules, dll, forced, remote
                 )
             )
 
@@ -309,11 +462,19 @@ class PupyClient(object):
         except dependencies.NotFoundError, e:
             raise ValueError('Module not found: {}'.format(e))
 
+        if remote:
+            logger.info('load_package({}) -> p:{} d:{}'.format(
+                requirements,
+                len(packages) if packages else None,
+                len(dlls) if dlls else None))
+
+            return packages, dlls
+
         if not contents and not dlls:
             return False
 
         if dlls:
-            if self.has_load_dll:
+            if self.load_dll:
                 for name, blob in dlls:
                     self.pupyimporter.load_dll(name, blob)
             else:
@@ -327,55 +488,37 @@ class PupyClient(object):
             return False
 
         if forced:
-            for module in forced:
-                self.pupyimporter.invalidate_module(module)
+            self.invalidate_packages(forced)
 
-        self.pupyimporter.pupy_add_package(
+        logger.info('Upload packages bundle, size={}'.format(len(packages)))
+        self.remote_add_package(
             packages,
             compressed=True,
             # Use None to prevent import-then-clean-then-search behavior
             name=(
-                None if ( remote or type(requirements) != str ) else requirements
+                None if type(requirements) != str else requirements
             )
         )
 
         new_deps.extend(contents)
-
         return True
 
     def unload_package(self, module_name):
         if not module_name.endswith(('.so', '.dll', '.pyd')):
-            self.pupyimporter.invalidate_module(module_name)
+            self.remote_invalidate_module(module_name)
 
     def remote_load_package(self, module_name):
-        logging.debug("remote module_name asked for : %s"%module_name)
+        logger.debug('remote_load_package for {} started'.format(module_name))
 
         try:
-            self.load_package(module_name, remote=True)
-            return True
+            return self.load_package(module_name, remote=True)
 
         except dependencies.NotFoundError:
-            logging.debug("no package %s found for remote client"%module_name)
+            logger.debug('remote_load_package for {} failed'.format(module_name))
+            return None, None
 
-        return False
+        finally:
+            logger.debug('remote_load_package for {} completed'.format(module_name))
 
     def remote_print_error(self, msg):
         self.pupsrv.handler.display_warning(msg)
-
-    def run_module(self, module_name, args):
-        """ start a module on this unique client and return the corresponding job """
-        module_name=self.pupsrv.get_module_name_from_category(module_name)
-        mod=self.pupsrv.get_module(module_name)
-        if not mod:
-            raise Exception("unknown module %s !"%modargs.module)
-        pj=None
-        modjobs=[x for x in self.pupsrv.jobs.itervalues() if x.pupymodules[0].get_name() == mod.get_name() and x.pupymodules[0].client==self]
-        if mod.daemon and mod.unique_instance and modjobs:
-            pj=modjobs[0]
-        else:
-            pj=PupyJob(self.pupsrv,"%s %s"%(module_name, args))
-            ps=mod(self, pj)
-            pj.add_module(ps)
-            self.pupsrv.add_job(pj)
-        pj.start(args)
-        return pj

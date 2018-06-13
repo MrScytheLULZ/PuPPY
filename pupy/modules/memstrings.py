@@ -14,41 +14,54 @@ class MemStrings(PupyModule):
 
     termevent = None
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(prog='memstrings', description=self.__doc__)
-        action = self.arg_parser.add_mutually_exclusive_group(required=True)
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(prog='memstrings', description=cls.__doc__)
+        action = cls.arg_parser.add_mutually_exclusive_group(required=True)
         action.add_argument('-p', '--pid', nargs='*', type=int, default=[],
                                 help='Include processes with specified pids')
         action.add_argument('-n', '--name', nargs='*', default=[],
                                 help='Include processes with specified names')
-        self.arg_parser.add_argument('-x', '--omit', type=str, default='isrx',
+        cls.arg_parser.add_argument('-x', '--omit', type=str, default='isrx',
                                 help='Avoid scanning: '
                                 'i - ranges with file mapping; '
                                 's - ranges with shared region; '
                                 'x - ranges with executable region; '
                                 'r - ranges with read-only region')
-        self.arg_parser.add_argument('-l', '--min-length', type=int, default=4,
+
+        regex = cls.arg_parser.add_mutually_exclusive_group()
+        regex.add_argument('-r', '--regex', type=str,
+                           help='Regex to match (default: printable strings). '
+                               'Example: "^[a-zA-Z_]+=[\\x20-\\x7e]+$" - env strings')
+
+        maxmin = regex.add_argument_group()
+        maxmin.add_argument('-l', '--min-length', type=int, default=4,
                                 help='Show only strings which are longer then specified length')
-        self.arg_parser.add_argument('-m', '--max-length', type=int, default=51,
+        maxmin.add_argument('-m', '--max-length', type=int, default=51,
                                 help='Show only strings which are shorter then specified length')
-        self.arg_parser.add_argument('-P', '--portions', type=int, default=8192,
+
+        cls.arg_parser.add_argument('-P', '--portions', type=int, default=8192,
                                 help='Strings portion block')
-        self.arg_parser.add_argument('-d', '--no-duplication', default=False, action='store_true',
+        cls.arg_parser.add_argument('-d', '--no-duplication', default=False, action='store_true',
                                 help='Enable strings deduplication (will increase memory usage)')
-        self.arg_parser.add_argument('-S', '--stdout', action='store_true', help='Show strings on stdout')
+        cls.arg_parser.add_argument('-S', '--stdout', action='store_true', help='Show strings on stdout')
 
     def run(self, args):
         targets = args.pid + args.name
 
-        self.termevent = self.client.conn.modules.threading.Event()
+        REvent = self.client.remote('threading', 'Event', False)
+        iterate_strings = self.client.remote('memstrings', 'iterate_strings', False)
+
+        self.termevent = REvent()
 
         last_pid = None
         last_log = None
 
         config = self.client.pupsrv.config or PupyConfig()
 
-        for pid, name, strings in self.client.conn.modules.memstrings.iterate_strings(
+        for pid, name, strings in iterate_strings(
                 targets,
+                args.regex,
                 min_length=args.min_length,
                 max_length=args.max_length,
                 omit=args.omit,
@@ -68,9 +81,7 @@ class MemStrings(PupyModule):
             if args.stdout:
                 self.success('Strings {}:{}'.format(name, pid))
                 for s in strings:
-                    self.stdout.write(s+'\n')
-
-                self.stdout.write('\n')
+                    self.log(s)
             else:
                 if last_pid != pid:
                     last_pid = pid

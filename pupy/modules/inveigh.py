@@ -2,9 +2,9 @@
 
 from pupylib.PupyModule import *
 from pupylib.utils.term import consize
+from pupylib import ROOT
 
 __class_name__="Inveigh"
-ROOT=os.path.abspath(os.path.join(os.path.dirname(__file__),".."))
 
 @config(compat="windows", category="privesc")
 class Inveigh(PupyModule):
@@ -17,12 +17,13 @@ class Inveigh(PupyModule):
 
     known_args = True
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(
-            prog="Inveigh", description=self.__doc__
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(
+            prog="Inveigh", description=cls.__doc__
         )
 
-        commands = self.arg_parser.add_subparsers(title='actions')
+        commands = cls.arg_parser.add_subparsers(title='actions')
         start = commands.add_parser('start', help='Start Inveigh')
         subtype = start.add_mutually_exclusive_group()
         subtype.add_argument('-R', '--relay', action='store_true', default=False, help='Start relay')
@@ -37,11 +38,15 @@ class Inveigh(PupyModule):
         info.add_argument('-R', '--relay', action='store_true', default=False, help='Help about relay')
 
     def run(self, args):
-        powershell = self.client.conn.modules['powershell']
+        pscall = self.client.remote('powershell', 'call')
+        psload = self.client.remote('powershell', 'load')
+        psloaded = self.client.remote('powershell', 'loaded', False)
+        psunload = self.client.remote('powershell', 'unload', False)
+
         script = 'inveigh'
         loaded = True
 
-        if not powershell.loaded(script):
+        if not psloaded(script):
             loaded = False
             if args.command in ('dump', 'stop'):
                 self.error('Module is not loaded yet')
@@ -54,7 +59,7 @@ class Inveigh(PupyModule):
                 content = content.read()
                 if args.relay:
                     content = content.replace('Invoke-InveighRelay', 'Invoke-Inveigh')
-                powershell.load(script, content, width=width)
+                psload(script, content, width=width)
 
         if args.command == 'start':
             expression = 'Invoke-Inveigh ' + ' '.join(args.unknown_args)
@@ -65,9 +70,9 @@ class Inveigh(PupyModule):
         elif args.command == 'help':
             expression = 'help Invoke-Inveigh ' + ' '.join(args.unknown_args)
 
-        output, rest = powershell.call(script, expression)
+        output, rest = pscall(script, expression)
         if args.command == 'stop' or ( args.command == 'help' and not loaded ):
-            powershell.unload(script)
+            psunload(script)
 
         if rest:
             self.warning(rest)

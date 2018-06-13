@@ -3,15 +3,16 @@
 # Reworked by Oleskii Shevchuk (@alxchk)
 # License: MIT
 
+__all__ = (
+    'UPNPError', 'FakeSocket', 'IGDClient',
+)
+
 import socket
-import argparse
 import urllib2
 from StringIO import StringIO
 from httplib import HTTPResponse
 from xml.etree.ElementTree import fromstring
 from urlparse import urlparse
-import ctypes
-import os
 import netaddr
 import logging
 
@@ -58,7 +59,7 @@ def httpparse(fp):
 
 
 # sendSOAP is based on part of source code from miranda-upnp.
-class IGDClient:
+class IGDClient(object):
     """
     UPnP IGD v1 Client class, supports all actions
     """
@@ -88,6 +89,11 @@ class IGDClient:
         'soap': 'http://schemas.xmlsoap.org/soap/envelope/',
     }
 
+    __slots__ = (
+        'ctrlURL', 'debug', 'pprint', 'isv6', 'timeout', 'intIP',
+        'igdsvc', 'available', 'pr', 'bindIP'
+    )
+
     def __init__(
             self,
             bindIP='0.0.0.0',
@@ -110,10 +116,12 @@ class IGDClient:
         self.pprint = pprint
         self.isv6 = False
         self.timeout = timeout
+        self.intIP = None
 
         if ctrlURL:
-            self.ctrlURL = urlparse(self.ctrlURL)
+            self.ctrlURL = urlparse(ctrlURL)
             self.bindIP = self._getOutgoingLocalAddress(self.ctrlURL.hostname)
+            self.intIP = self.bindIP
             self.isv6  = self.bindIP.version == 6
         else:
             self.ctrlURL = None
@@ -126,10 +134,9 @@ class IGDClient:
                 self.igdsvc = "WANIPC"
 
             self.discovery()
-            if not self.ctrlURL:
-                self.discovery(st='upnp:rootdevice')
+            self.discovery(st='upnp:rootdevice')
 
-        if self.available:
+        if self.available and not self.intIP:
             self.intIP = self._getOutgoingLocalAddress()
 
     @property
@@ -149,13 +156,18 @@ class IGDClient:
         self.pprint = p
 
     def _getOutgoingLocalAddress(self):
-        ctrlurl = urlparse(self.ctrlURL)
-        remote_addr = netaddr.IPAddress(ctrlurl.hostname)
-        rcon = socket.socket(
-            socket.AF_INET if remote_addr.version == 4 else socket.AF_INET6,
-        )
-        rcon.connect((remote_addr.format(), ctrlurl.port or 1900))
-        return netaddr.IPAddress(rcon.getsockname()[0])
+        try:
+            ctrlurl = urlparse(self.ctrlURL)
+            remote_addr = netaddr.IPAddress(ctrlurl.hostname)
+            rcon = socket.socket(
+                socket.AF_INET if remote_addr.version == 4 else socket.AF_INET6,
+            )
+            rcon.connect((remote_addr.format(), ctrlurl.port or 1900))
+            return netaddr.IPAddress(rcon.getsockname()[0])
+
+        except:
+            self.available = False
+            return None
 
     def _get1stTagText(self, xmls, tagname_list):
         """
@@ -332,7 +344,7 @@ class IGDClient:
         while True:
             try:
                 items.append(self.GetGenericPortMappingEntry(index))
-            except UPNPError as e:
+            except:
                 break
 
             index += 1
@@ -463,7 +475,7 @@ class IGDClient:
             'NewWarnDisconnectDelay': (delay, 'ui4'),
         }
 
-        resp_xml = self.sendSOAP(
+        self.sendSOAP(
             self.pr.netloc,
             'urn:schemas-upnp-org:service:WANIPConnection:1',
             self.ctrlURL, upnp_method, sendArgs
@@ -475,7 +487,7 @@ class IGDClient:
             'NewIdleDisconnectTime': (disconnect_time, 'ui4'),
         }
 
-        resp_xml = self.sendSOAP(
+        self.sendSOAP(
             self.pr.netloc,
             'urn:schemas-upnp-org:service:WANIPConnection:1',
             self.ctrlURL, upnp_method, sendArgs
@@ -487,7 +499,7 @@ class IGDClient:
             'NewAutoDisconnectTime': (disconnect_time, 'ui4'),
         }
 
-        resp_xml = self.sendSOAP(
+        self.sendSOAP(
             self.pr.netloc,
             'urn:schemas-upnp-org:service:WANIPConnection:1',
             self.ctrlURL, upnp_method, sendArgs
@@ -496,7 +508,7 @@ class IGDClient:
     def ForceTermination(self):
         upnp_method = 'ForceTermination'
         sendArgs = {}
-        resp_xml = self.sendSOAP(
+        self.sendSOAP(
             self.pr.netloc,
             'urn:schemas-upnp-org:service:WANIPConnection:1',
             self.ctrlURL, upnp_method, sendArgs
@@ -505,7 +517,7 @@ class IGDClient:
     def RequestTermination(self):
         upnp_method = 'RequestTermination'
         sendArgs = {}
-        resp_xml = self.sendSOAP(
+        self.sendSOAP(
             self.pr.netloc,
             'urn:schemas-upnp-org:service:WANIPConnection:1',
             self.ctrlURL,
@@ -515,7 +527,7 @@ class IGDClient:
     def RequestConnection(self):
         upnp_method = 'RequestConnection'
         sendArgs = {}
-        resp_xml = self.sendSOAP(
+        self.sendSOAP(
             self.pr.netloc,
             'urn:schemas-upnp-org:service:WANIPConnection:1',
             self.ctrlURL,
@@ -541,7 +553,7 @@ class IGDClient:
         sendArgs = {
             'NewConnectionType': (ctype, 'string'),
         }
-        resp_xml = self.sendSOAP(
+        self.sendSOAP(
             self.pr.netloc,
             'urn:schemas-upnp-org:service:WANIPConnection:1',
             self.ctrlURL,
@@ -702,7 +714,7 @@ class IGDClient:
             "UniqueID": (uid, 'ui2'),
             "NewLeaseTime": (lease, 'ui4'),
         }
-        resp_xml = self.sendSOAP(
+        self.sendSOAP(
             self.pr.netloc,
             'urn:schemas-upnp-org:service:WANIPv6FirewallControl:1',
             self.ctrlURL,
@@ -715,7 +727,7 @@ class IGDClient:
         sendArgs = {
             "UniqueID": (uid, 'ui2'),
         }
-        resp_xml = self.sendSOAP(
+        self.sendSOAP(
             self.pr.netloc,
             'urn:schemas-upnp-org:service:WANIPv6FirewallControl:1',
             self.ctrlURL,

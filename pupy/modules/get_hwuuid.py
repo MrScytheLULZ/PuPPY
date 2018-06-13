@@ -11,12 +11,15 @@ class GetHwUuid(PupyModule):
         'all': [ 'hwuuid' ]
     }
 
-    def init_argparse(self):
-        self.arg_parser = PupyArgumentParser(
+    @classmethod
+    def init_argparse(cls):
+        cls.arg_parser = PupyArgumentParser(
             prog='get_hwuuid',
-            description=self.__doc__
+            description=cls.__doc__
         )
 
     def run(self, args):
-        method, uuid = self.client.conn.modules['hwuuid'].get_hw_uuid()
-        print '{} ({})'.format(method, uuid)
+        get_hw_uuid = self.client.remote('hwuuid', 'get_hw_uuid')
+
+        method, uuid = get_hw_uuid()
+        self.success('{} ({})'.format(method, uuid))

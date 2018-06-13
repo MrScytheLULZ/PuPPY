@@ -3,7 +3,6 @@
 
 from pupylib.PupyModule import *
 from pupylib.PupyCompleter import *
-from pupylib.PupyCmd import PupyCmd
 from rpyc.utils.classic import upload
 from pupylib.utils.credentials import Credentials
 from pupylib.utils.term import colorize, terminal_size
@@ -48,7 +47,8 @@ class LaZagne(PupyModule):
         'CredType', 'Category', 'SavePassword'
     ])
 
-    def init_argparse(self):
+    @classmethod
+    def init_argparse(cls):
         header = '|====================================================================|\n'
         header += '|                                                                    |\n'
         header += '|                        The LaZagne Project                         |\n'
@@ -57,8 +57,8 @@ class LaZagne(PupyModule):
         header += '|                                                                    |\n'
         header += '|====================================================================|\n\n'
 
-        self.arg_parser = PupyArgumentParser(prog="lazagne", description=header + self.__doc__)
-        self.arg_parser.add_argument('category', nargs='?', help='specify category', default='all')
+        cls.arg_parser = PupyArgumentParser(prog="lazagne", description=header + cls.__doc__)
+        cls.arg_parser.add_argument('category', nargs='?', help='specify category', default='all')
 
     def run(self, args):
         db = Credentials(
@@ -79,12 +79,18 @@ class LaZagne(PupyModule):
 
                 first_user = False
                 passwordsFound = False
-                self.log(colorize('\n########## User: {} ##########'.format(
-                    r[1].encode('utf-8', errors='replace')), 'yellow'))
+                user = r[1]
+                if type(user) == str:
+                    user = user.decode('utf-8', errors='replace')
+
+                self.log(colorize(u'\n########## User: {} ##########'.format(user), 'yellow'))
 
             elif r[2]:
                 passwordsFound = True
-                self.print_results(r[0], r[1], r[2], db)
+                try:
+                    self.print_results(r[0], r[1], r[2], db)
+                except Exception, e:
+                    self.error('{}: {}'.format(r[1], e))
 
         if not passwordsFound:
             self.warning('no passwords found !')
@@ -161,6 +167,9 @@ class LaZagne(PupyModule):
             return []
 
         results = []
+
+        if type(creds) == str:
+            raise Exception(creds)
 
         for cred in creds:
             if isinstance(cred, dict):
@@ -272,13 +281,10 @@ class LaZagne(PupyModule):
             )
 
             if not module in self.NON_TABLE:
-                self.log(
-                    PupyCmd.table_format(
-                        self.prepare_fields(
-                            creds, remove=self.FILTER_COLUMNS
-                        )
-                    )
-                )
+                self.table(
+                    self.prepare_fields(
+                        creds, remove=self.FILTER_COLUMNS
+                    ))
             else:
                 for cred in creds:
                     for k, v in cred.iteritems():

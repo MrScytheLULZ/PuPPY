@@ -1,9 +1,10 @@
 #!/usr/bin/env python
-# -*- coding: UTF8 -*-
+# -*- coding: utf-8 -*-
 # Copyright (c) 2015, Nicolas VERDIER (contact@n1nj4.eu)
 # Pupy is under the BSD 3-Clause license. see the LICENSE file at the root of the project for the detailed licence terms
 
 from . import conf
+
 import logging
 
 class PupyCategories(object):
@@ -43,12 +44,12 @@ class PupyCategories(object):
 
     def get_module_from_path(self, shell_path):
         """ take a auto-completed path and return the corresponding module """
-        tab=shell_path.strip('/').split('/')
-        if len(tab)==2: #cat/mod
+        tab = shell_path.strip('/').split('/')
+        if len(tab) == 2: #cat/mod
             for mod in self.categories[tab[0]]:
-                if mod.get_name()==tab[1]:
+                if mod.get_name() == tab[1]:
                     return mod
-        elif len(tab)==3: #os/cat/mod
+        elif len(tab) == 3: #os/cat/mod
             for mod in self.categories[tab[1]]:
                 if self.is_os_compatible(mod, tab[0]) and mod.get_name()==tab[2]:
                     return mod
@@ -76,6 +77,3 @@ class PupyCategories(object):
         if not l:
             l+=[x.rsplit("/",1)[1]+" " for x in self.shell_list if x.rsplit("/",1)[1].startswith(start_text)]
         return l
-
-
-
