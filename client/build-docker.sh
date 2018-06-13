@@ -4,7 +4,7 @@ SELF=`readlink -f "$0"`
 PUPY=`dirname "$SELF"`/../
 PUPY=`readlink -f "$PUPY"`
 
-DOCKER_REPO=${DOCKER_REPO:-"alxchk"}
+DOCKER_REPO=${DOCKER_REPO:-"n1nj4sec"}
 CLEAN=${CLEAN:-"no"}
 
 if [ ! -z "$REPO" ]; then
